@@ -73,7 +73,7 @@ ROOT_FOLDER = r"./videos"
 Set the output CSV filename:
 
 ```python
-OUTPUT_CSV = "video_quality_report_v2.csv"
+OUTPUT_CSV = "video_quality_report.csv"
 ```
 
 Run the scanner:
