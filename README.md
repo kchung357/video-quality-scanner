@@ -89,7 +89,7 @@ The script will scan the selected folder, analyze video files, and generate a CS
 By default, the report is saved as:
 
 ```text
-video_quality_report_v2.csv
+video_quality_report.csv
 ```
 
 The CSV report may include columns such as:
