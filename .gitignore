@@ -216,3 +216,41 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Output reports
+*.csv
+video_quality_report*.csv
+
+# Generated contact sheets
+contact_sheets/
+*.jpg
+*.jpeg
+*.png
+
+# Local/private video folders
+videos/
+video/
+media/
+av/
+data/
+input/
+output/
+
+# Large video files
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.mpg
+*.mpeg
+*.m4v
+*.ts
+*.m2ts
+*.webm
+*.flv
+*.3gp
