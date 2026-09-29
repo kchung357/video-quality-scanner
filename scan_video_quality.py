@@ -1609,7 +1609,7 @@ def scan_library(config):
     rows = list(existing) if config.resume else []
 
     def checkpoint():
-        write_report(config.output_csv, rows)
+        return write_report(config.output_csv, rows)
 
     if not pending:
         frame = checkpoint()
