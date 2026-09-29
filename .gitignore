@@ -223,6 +223,7 @@ Thumbs.db
 
 # Output reports
 *.csv
+*.csv.tmp
 video_quality_report*.csv
 
 # Generated contact sheets
