@@ -293,13 +293,15 @@ class ReportTests(unittest.TestCase):
     def test_cli_overrides_defaults(self):
         defaults = scan.build_parser().parse_args([])
         self.assertTrue(defaults.resume)
-        self.assertEqual(defaults.samples, scan.SAMPLE_COUNT)
+        self.assertTrue(defaults.pairs)
+        self.assertIsNone(defaults.samples)
         args = scan.build_parser().parse_args([
             "--root", "lib",
             "--no-resume",
             "--workers", "2",
             "--contact-sheets",
             "--samples", "4",
+            "--no-pairs",
         ])
         config = scan.config_from_args(args)
         self.assertEqual(config.root_folder, "lib")
@@ -307,6 +309,8 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(config.create_contact_sheets)
         self.assertEqual(config.workers, 2)
         self.assertEqual(config.sample_count, 4)
+        self.assertTrue(config.samples_explicit)
+        self.assertFalse(config.pairs)
 
     def test_wrap_text_fits_the_requested_width(self):
         lines = scan.wrap_text("word " * 40 + "Supercalifragilistic", 80, 0.5, 1)
@@ -389,6 +393,198 @@ class ScanIntegrationTests(unittest.TestCase):
             resumed = pd.read_csv(report)
             self.assertEqual(len(resumed), 3)
             self.assertEqual(set(resumed["path"]), set(frame["path"]))
+
+    def test_pair_mode_compares_the_same_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            encode_clip(root / "DVDMS-388.mp4", "testsrc=size=320x240:rate=25:duration=1")
+            encode_clip(
+                root / "DVDMS-388_3_prob4.mp4",
+                "testsrc=size=320x240:rate=25:duration=1",
+                "-vf", "gblur=sigma=8,setsar=97/80",
+            )
+            report = root / "report.csv"
+            scan.main([
+                "--root", str(root),
+                "--output", str(report),
+                "--samples", "2",
+                "--workers", "1",
+                "--no-contact-sheets",
+                "--frame-timeout", "30",
+            ])
+            groups = pd.read_csv(root / "report_groups.csv")
+            self.assertEqual(len(groups), 1)
+            row = groups.iloc[0]
+            self.assertEqual(row["verdict"], "regressed")
+            self.assertTrue(bool(row["sar_mismatch"]))
+            self.assertIn("DVDMS-388.mp4", str(row["best_version"]))
+            self.assertLess(float(row["blur_delta"]), 0)
+            frame = pd.read_csv(report)
+            processed = frame.loc[frame["filename"] == "DVDMS-388_3_prob4.mp4"].iloc[0]
+            self.assertTrue(str(processed["recommendation"]).startswith("already_processed_review_only+"))
+            self.assertIn("paired_with_original", str(processed["issue_flags"]))
+
+
+class MetricExtensionTests(unittest.TestCase):
+    def test_noise_sigma_is_not_the_zero_median(self):
+        rng = np.random.default_rng(0)
+        noisy = np.clip(128 + rng.normal(0, 8, (180, 240)), 0, 255).astype(np.uint8)
+        flat = np.full((180, 240), 128, np.uint8)
+        edges = np.full((180, 240), 40, np.uint8)
+        cv2.rectangle(edges, (20, 20), (200, 140), 220, -1)
+        checker = (np.indices((180, 240)).sum(axis=0) % 2 * 255).astype(np.uint8)
+        self.assertGreater(scan.noise_sigma(noisy), 5)
+        self.assertLess(scan.noise_sigma(flat), 0.5)
+        self.assertLess(scan.noise_sigma(edges), 1)
+        self.assertLess(scan.noise_sigma(checker), 1)
+        stats = scan.aggregate_metrics([scan.measure_frame(noisy) for _ in range(3)])
+        self.assertGreater(stats["median_noise"], 1)
+
+    def test_blur_class_splits_sharp_and_grain(self):
+        self.assertEqual(scan.classify_blur(400, 1.1), "sharp")
+        self.assertEqual(scan.classify_blur(400, 3.0), "grain_dominated")
+
+    def test_score_parts_add_up_and_codec_adjusts_bitrate(self):
+        parts = scan.issue_score_parts(1080, 20, 1.8, 0.03)
+        self.assertEqual(parts["score_resolution"], 0)
+        self.assertEqual(parts["score_blur"], 45)
+        self.assertEqual(parts["score_blockiness"], 35)
+        self.assertEqual(parts["score_bitrate"], 15)
+        self.assertEqual(sum(parts.values()), 95)
+        bpp = scan.bits_per_pixel_per_frame(2_000_000, 1920, 1080, 30)
+        self.assertEqual(scan.bitrate_points(1080, bpp), 15)
+        self.assertEqual(scan.bitrate_points(1080, bpp, codec="hevc"), 8)
+        self.assertEqual(scan.bitrate_points(1080, bpp, vr=True), 0)
+
+    def test_blurry_hd_and_upscale_and_vr_recommendations(self):
+        self.assertEqual(
+            scan.assign_recommendation(1080, 50, 1.1, 32),
+            "check_source_upscaled_or_denoise",
+        )
+        self.assertEqual(
+            scan.assign_recommendation(
+                1080, 50, 1.1, 32, upscale=True, effective_side=480,
+            ),
+            "restore_or_deblur_then_upscale",
+        )
+        self.assertEqual(
+            scan.assign_recommendation(1920, 400, 1.05, 0, vr=True),
+            "vr_equirect_review",
+        )
+        flags = scan.build_issue_flags(1920, 400, 1.1, 0.03, vr=True)
+        self.assertIn("vr_equirect", flags)
+        self.assertNotIn("low_bitrate_for_hd", flags)
+        self.assertTrue(scan.is_vr_equirect(3840, 1920))
+        self.assertFalse(scan.is_vr_equirect(1920, 1080))
+
+    def test_duplicate_frames_are_excluded(self):
+        detail = np.full((80, 80, 3), 180, dtype=np.uint8)
+        cv2.rectangle(detail, (8, 8), (72, 72), (20, 20, 20), 2)
+        measured = [scan.measure_frame(detail), scan.measure_frame(detail)]
+        scan.mark_duplicate_frames(measured, [(0.0, detail), (1.0, detail)])
+        stats = scan.aggregate_metrics(measured)
+        self.assertEqual(stats["frames_used"], 1)
+        self.assertEqual(stats["frames_excluded"], 1)
+        self.assertFalse(stats["mostly_dark"])
+
+    def test_letterbox_crop_and_bandwidth_direction(self):
+        checks = scan.calibration_checks()
+        failed = [name for name, ok, _detail in checks if not ok]
+        self.assertEqual(failed, [])
+
+    def test_adaptive_sample_count_and_jitter(self):
+        adaptive = scan.ScanConfig(samples_explicit=False)
+        self.assertEqual(scan.resolved_sample_count(7200, adaptive), 24)
+        self.assertEqual(scan.resolved_sample_count(10 * 3600, adaptive), 40)
+        self.assertEqual(scan.resolved_sample_count(30, adaptive), 16)
+        forced = scan.ScanConfig(sample_count=2, samples_explicit=True)
+        self.assertEqual(scan.resolved_sample_count(7200, forced), 2)
+        first = scan.sample_timestamps(3600, 8, seed=3)
+        self.assertEqual(first, scan.sample_timestamps(3600, 8, seed=3))
+        self.assertNotEqual(first, scan.sample_timestamps(3600, 8, seed=9))
+        self.assertGreaterEqual(min(first), 0)
+        self.assertLess(max(first), 3600)
+
+    def test_config_file_overrides_thresholds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(
+                "blur_very: 10\ncodec_efficiency:\n  hevc: 2.0\n",
+                encoding="utf-8",
+            )
+            loaded = scan.load_thresholds(path)
+        self.assertEqual(loaded.blur_very, 10)
+        self.assertEqual(loaded.codec_efficiency["hevc"], 2.0)
+        self.assertEqual(loaded.codec_efficiency["h264"], 1.0)
+        self.assertEqual(loaded.blur_soft, scan.BLUR_SOFT)
+        with self.assertRaises(ValueError):
+            scan.thresholds_from_mapping({"not_a_knob": 1})
+
+    def test_resume_requires_schema_size_and_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.mp4"
+            path.write_bytes(b"hello")
+            size, mtime = scan.file_identity(path)
+            current = {
+                "schema_version": scan.SCHEMA_VERSION,
+                "path": str(path),
+                "size": size,
+                "mtime": mtime,
+            }
+            self.assertTrue(scan.row_is_current(current))
+            stale = dict(current)
+            stale["schema_version"] = 1
+            self.assertFalse(scan.row_is_current(stale))
+            changed = dict(current)
+            changed["size"] = size + 1
+            self.assertFalse(scan.row_is_current(changed))
+
+    def test_pair_matching_and_verdict(self):
+        self.assertTrue(scan.stems_related("DVDMS-388.mp4", "DVDMS-388_3_prob4.mp4"))
+        self.assertFalse(scan.stems_related("color.mp4", "wide.mp4"))
+        self.assertEqual(scan.normalized_stem("movie_topaz.mkv"), "movie")
+
+        def scored(path, **extra):
+            row = {
+                "path": path,
+                "filename": Path(path).name,
+                "folder": str(Path(path).parent),
+                "duration": 90,
+                "quality_issue_score": 10,
+                "error": "",
+                "is_probably_processed": False,
+                "display_width": 1280,
+                "display_height": 720,
+                "sample_aspect_ratio": "1:1",
+                "size": 10,
+            }
+            row.update(extra)
+            return row
+
+        original = scored("/library/title/DVDMS-388.mp4", size=50)
+        processed = scored(
+            "/library/title/DVDMS-388_3_prob4.mp4",
+            is_probably_processed=True,
+            display_width=1552,
+            sample_aspect_ratio="97:80",
+            size=20,
+        )
+        unrelated = scored("/library/title/other-show.mp4", duration=90)
+        plans = scan.plan_pairs([original, processed, unrelated], tolerance=1.0)
+        paired = [plan for plan in plans if plan[2] != "ambiguous_group"]
+        self.assertEqual(len(paired), 1)
+        self.assertEqual(paired[0][0]["filename"], "DVDMS-388.mp4")
+        self.assertEqual(paired[0][1]["filename"], "DVDMS-388_3_prob4.mp4")
+        self.assertTrue(scan.aspects_mismatch(original, processed))
+
+        softer = {"median_blur": 40, "avg_noise": 2, "avg_block": 1.1, "avg_halo": 1}
+        reference = {"median_blur": 120, "avg_noise": 2, "avg_block": 1.1, "avg_halo": 1}
+        sharper = {"median_blur": 220, "avg_noise": 1, "avg_block": 1.0, "avg_halo": 1}
+        halo = {"median_blur": 500, "avg_noise": 1, "avg_block": 1.0, "avg_halo": 20}
+        self.assertEqual(scan.pair_verdict(reference, softer), "regressed")
+        self.assertEqual(scan.pair_verdict(reference, sharper), "improved")
+        self.assertEqual(scan.pair_verdict(reference, halo), "oversharpened")
+        self.assertEqual(scan.pair_verdict(reference, reference), "similar")
 
 
 if __name__ == "__main__":
