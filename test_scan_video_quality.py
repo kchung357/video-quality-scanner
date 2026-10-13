@@ -401,7 +401,7 @@ class ScanIntegrationTests(unittest.TestCase):
             encode_clip(
                 root / "DVDMS-388_3_prob4.mp4",
                 "testsrc=size=320x240:rate=25:duration=1",
-                "-vf", "gblur=sigma=8,setsar=97/80",
+                "-vf", "gblur=sigma=2",
             )
             report = root / "report.csv"
             scan.main([
@@ -415,10 +415,11 @@ class ScanIntegrationTests(unittest.TestCase):
             groups = pd.read_csv(root / "report_groups.csv")
             self.assertEqual(len(groups), 1)
             row = groups.iloc[0]
-            self.assertEqual(row["verdict"], "regressed")
-            self.assertTrue(bool(row["sar_mismatch"]))
+            self.assertIn("lost_detail", str(row["verdict"]))
+            self.assertEqual(row["action"], "keep_original")
+            self.assertFalse(bool(row["geometry_mismatch"]))
             self.assertIn("DVDMS-388.mp4", str(row["best_version"]))
-            self.assertLess(float(row["blur_delta"]), 0)
+            self.assertLess(float(row["blur_native"]), 0.85)
             frame = pd.read_csv(report)
             processed = frame.loc[frame["filename"] == "DVDMS-388_3_prob4.mp4"].iloc[0]
             self.assertTrue(str(processed["recommendation"]).startswith("already_processed_review_only+"))
@@ -462,12 +463,6 @@ class MetricExtensionTests(unittest.TestCase):
             "check_source_upscaled_or_denoise",
         )
         self.assertEqual(
-            scan.assign_recommendation(
-                1080, 50, 1.1, 32, upscale=True, effective_side=480,
-            ),
-            "restore_or_deblur_then_upscale",
-        )
-        self.assertEqual(
             scan.assign_recommendation(1920, 400, 1.05, 0, vr=True),
             "vr_equirect_review",
         )
@@ -487,7 +482,7 @@ class MetricExtensionTests(unittest.TestCase):
         self.assertEqual(stats["frames_excluded"], 1)
         self.assertFalse(stats["mostly_dark"])
 
-    def test_letterbox_crop_and_bandwidth_direction(self):
+    def test_letterbox_crop_and_metric_direction(self):
         checks = scan.calibration_checks()
         failed = [name for name, ok, _detail in checks if not ok]
         self.assertEqual(failed, [])
@@ -561,12 +556,27 @@ class MetricExtensionTests(unittest.TestCase):
             row.update(extra)
             return row
 
-        original = scored("/library/title/DVDMS-388.mp4", size=50)
+        original = scored(
+            "/library/title/DVDMS-388.mp4",
+            size=50,
+            content_width=1280,
+            content_height=720,
+        )
         processed = scored(
             "/library/title/DVDMS-388_3_prob4.mp4",
             is_probably_processed=True,
             display_width=1552,
+            display_height=720,
+            content_width=1280,
+            content_height=720,
             sample_aspect_ratio="97:80",
+            size=20,
+        )
+        cropped = scored(
+            "/library/title/DVDMS-388_badcrop.mp4",
+            is_probably_processed=True,
+            content_width=1113,
+            content_height=550,
             size=20,
         )
         unrelated = scored("/library/title/other-show.mp4", duration=90)
@@ -575,16 +585,151 @@ class MetricExtensionTests(unittest.TestCase):
         self.assertEqual(len(paired), 1)
         self.assertEqual(paired[0][0]["filename"], "DVDMS-388.mp4")
         self.assertEqual(paired[0][1]["filename"], "DVDMS-388_3_prob4.mp4")
-        self.assertTrue(scan.aspects_mismatch(original, processed))
+        self.assertFalse(scan.aspects_mismatch(original, processed))
+        self.assertTrue(scan.aspects_mismatch(original, cropped))
 
-        softer = {"median_blur": 40, "avg_noise": 2, "avg_block": 1.1, "avg_halo": 1}
-        reference = {"median_blur": 120, "avg_noise": 2, "avg_block": 1.1, "avg_halo": 1}
-        sharper = {"median_blur": 220, "avg_noise": 1, "avg_block": 1.0, "avg_halo": 1}
-        halo = {"median_blur": 500, "avg_noise": 1, "avg_block": 1.0, "avg_halo": 20}
-        self.assertEqual(scan.pair_verdict(reference, softer), "regressed")
-        self.assertEqual(scan.pair_verdict(reference, sharper), "improved")
-        self.assertEqual(scan.pair_verdict(reference, halo), "oversharpened")
-        self.assertEqual(scan.pair_verdict(reference, reference), "similar")
+        def deltas(**extra):
+            base = {
+                "blur_native": 1.0,
+                "blur_vs_base": 1.0,
+                "block_native": 0.0,
+                "noise_native": 1.0,
+                "halo_vs_base": 1.0,
+                "halo_delta": 0.0,
+                "pair_misaligned": False,
+                "geometry_mismatch": False,
+            }
+            base.update(extra)
+            return base
+
+        self.assertEqual(scan.pair_verdict(deltas(blur_native=0.4)), "regressed:lost_detail")
+        self.assertEqual(scan.pair_verdict(deltas(block_native=0.4)), "regressed:more_blocky")
+        self.assertEqual(
+            scan.pair_verdict(deltas(halo_vs_base=2.0, halo_delta=8.0)),
+            "regressed:oversharpened",
+        )
+        self.assertEqual(scan.pair_verdict(deltas(blur_vs_base=1.4)), "improved")
+        self.assertEqual(scan.pair_verdict(deltas()), "neutral")
+        self.assertEqual(scan.pair_verdict(deltas(pair_misaligned=True)), "pair_misaligned")
+        self.assertEqual(scan.pair_action("improved"), "keep_processed")
+        self.assertEqual(scan.pair_action("neutral"), "keep_original")
+        self.assertEqual(scan.pair_action("regressed:lost_detail"), "keep_original")
+        self.assertEqual(scan.pair_action("pair_misaligned"), "manual_review")
+
+    def test_retired_upscale_config_keys_are_ignored(self):
+        loaded = scan.thresholds_from_mapping({
+            "upscale_bandwidth_max": 0.5,
+            "bandwidth_drop_db": 10,
+            "blur_very": 12,
+        })
+        self.assertEqual(loaded.blur_very, 12)
+        self.assertFalse(hasattr(loaded, "upscale_bandwidth_max"))
+
+
+class GeometryAndPairTests(unittest.TestCase):
+    def test_geometry_plan_covers_bars_sar_and_aspect(self):
+        self.assertEqual(
+            scan.geometry_plan(1280, 720, (112, 0, 1056, 720), sar=97 / 80),
+            "crop_bars+reset_sar:1280x720",
+        )
+        self.assertEqual(
+            scan.geometry_plan(720, 480, (0, 0, 720, 480), sar=1),
+            "pad_to_16x9:854x480",
+        )
+        self.assertEqual(
+            scan.geometry_plan(1920, 816, (0, 0, 1920, 816), sar=1),
+            "pad_to_16x9:1920x1080",
+        )
+        self.assertEqual(
+            scan.geometry_plan(1920, 1038, (0, 0, 1920, 1038), sar=1),
+            "crop_to_16x9:1920x1080",
+        )
+        self.assertEqual(scan.geometry_plan(1920, 1080, (0, 0, 1920, 1080), sar=1), "")
+        self.assertEqual(
+            scan.geometry_plan(720, 480, (0, 0, 720, 480), sar=32 / 27),
+            "reset_sar:854x480",
+        )
+        self.assertEqual(
+            scan.geometry_plan(3840, 1920, (0, 0, 3840, 1920), sar=1, vr=True),
+            "",
+        )
+
+    def test_letterbox_consensus_ignores_dark_and_minority_crops(self):
+        bright = np.full((100, 160, 3), 140, np.uint8)
+        bars = np.zeros((100, 160, 3), np.uint8)
+        bars[20:80, :] = 140
+        dark = np.zeros((100, 160, 3), np.uint8)
+        self.assertEqual(scan.consensus_letterbox([bars] * 6 + [bright] * 2), (0, 20, 160, 60))
+        self.assertEqual(scan.consensus_letterbox([bright] * 6 + [dark] * 4), (0, 0, 160, 100))
+        self.assertEqual(scan.consensus_letterbox([bars] * 3 + [bright] * 5), (0, 0, 160, 100))
+
+    def _show(self, metrics):
+        summary = scan.summarize_pair_metrics([metrics])
+        return scan.pair_verdict(summary), summary
+
+    def test_pair_frames_distinguish_upscale_blur_blocks_halo_and_levels(self):
+        original = cv2.cvtColor(scan._natural_frame(180, 320, 7), cv2.COLOR_GRAY2BGR)
+        cubic = cv2.resize(original, (640, 360), interpolation=cv2.INTER_CUBIC)
+        verdict, summary = self._show(scan.evaluate_pair_frames(original, cubic))
+        self.assertEqual(verdict, "neutral")
+        self.assertGreater(summary["ssim"], 0.9)
+
+        blurred = cv2.GaussianBlur(original, (0, 0), 2.0)
+        blurred_up = cv2.resize(blurred, (640, 360), interpolation=cv2.INTER_CUBIC)
+        verdict, summary = self._show(scan.evaluate_pair_frames(original, blurred_up))
+        self.assertEqual(verdict, "regressed:lost_detail")
+        self.assertLess(summary["blur_native"], 0.65)
+
+        yy, xx = np.mgrid[0:180, 0:320]
+        photo = np.clip(128 + 40 * np.sin(xx / 3.0) + 25 * np.sin(yy / 4.0), 0, 255).astype(np.uint8)
+        photo = cv2.cvtColor(photo, cv2.COLOR_GRAY2BGR)
+        base = cv2.resize(photo, (640, 360), interpolation=cv2.INTER_CUBIC)
+        base_f = base.astype(np.float32)
+        boosted = np.clip(
+            base_f + 0.25 * (base_f - cv2.GaussianBlur(base_f, (0, 0), 2.0)),
+            0,
+            255,
+        ).astype(np.uint8)
+        verdict, summary = self._show(scan.evaluate_pair_frames(photo, boosted))
+        self.assertEqual(verdict, "improved")
+        self.assertGreater(summary["blur_vs_base"], 1.15)
+
+        edge = np.full((180, 320, 3), 50, np.uint8)
+        cv2.rectangle(edge, (40, 30), (200, 140), (190, 190, 190), -1)
+        cv2.circle(edge, (240, 90), 40, (210, 210, 210), -1)
+        edge_base = cv2.resize(edge, (640, 360), interpolation=cv2.INTER_CUBIC)
+        halo = np.clip(
+            edge_base.astype(np.float32)
+            + 1.2 * (edge_base.astype(np.float32) - cv2.GaussianBlur(edge_base, (0, 0), 1.0)),
+            0,
+            255,
+        ).astype(np.uint8)
+        verdict, _summary = self._show(scan.evaluate_pair_frames(edge, halo))
+        self.assertEqual(verdict, "regressed:oversharpened")
+
+        scene = np.full((240, 424), 128, np.float32)
+        yy, xx = np.mgrid[0:240, 0:424]
+        scene += 30 * np.sin(xx / 5.0) + 20 * np.sin(yy / 7.0)
+        scene = np.clip(scene, 0, 255).astype(np.uint8)
+        coded = scene.astype(np.float32).copy()
+        for y in range(0, 240, 8):
+            for x in range(0, 424, 8):
+                coded[y:y + 8, x:x + 8] = coded[y:y + 8, x:x + 8].mean()
+        upscaled = cv2.resize(coded.astype(np.uint8), (636, 360), interpolation=cv2.INTER_CUBIC)
+        self.assertGreater(
+            scan.blockiness_scaled(upscaled, 636 / 424, 360 / 240),
+            scan.blockiness_score(upscaled),
+        )
+        verdict, summary = self._show(scan.evaluate_pair_frames(scene, upscaled))
+        self.assertIn("more_blocky", verdict)
+        self.assertGreater(summary["block_native"], 0.10)
+
+        shifted = np.clip(photo.astype(np.int16) - 16, 0, 255).astype(np.uint8)
+        verdict, summary = self._show(scan.evaluate_pair_frames(photo, shifted))
+        self.assertEqual(verdict, "neutral")
+        self.assertTrue(summary["range_shift"])
+        self.assertGreater(summary["ssim"], 0.9)
+        self.assertAlmostEqual(summary["luma_delta"], 16.0, delta=1.0)
 
 
 if __name__ == "__main__":

@@ -18,10 +18,17 @@
 # sd_bpp_low: 0.09
 # dark_mean_brightness: 20
 # flat_std_max: 8
-# upscale_bandwidth_max: 0.66
-# bandwidth_drop_db: 22
 # combing_min: 0.12
 # halo_flag: 8
+# pair_blur_detail_ratio: 0.85
+# pair_blur_severe_ratio: 0.65
+# pair_block_delta: 0.10
+# pair_halo_ratio: 1.45
+# pair_halo_delta: 4
+# pair_blur_vs_base: 1.15
+# geometry_fit_tolerance: 0.03
+# geometry_crop_area_max: 0.10
+# geometry_aspect_tolerance: 0.05
 # codec_efficiency:
 #   h264: 1.0
 #   hevc: 1.5

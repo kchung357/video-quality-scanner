@@ -2,7 +2,8 @@
 
 Frame samples are full-resolution raw frames. Blur is measured after a
 letterbox crop and a scale to the analysis width. Blockiness stays on the
-decoded pixel grid. Noise uses a float estimator. Run
+decoded pixel grid. Noise uses a float estimator. Pair mode asks whether a
+processed file beat a plain upscale of the original. Run
 ``python scan_video_quality.py --help`` for the command-line options.
 """
 
@@ -30,7 +31,7 @@ from tqdm import tqdm
 # Configuration
 # ============================================================
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 ROOT_FOLDER = r"./videos"
 OUTPUT_CSV = "video_quality_report.csv"
@@ -47,7 +48,6 @@ SAMPLE_EVERY_SECONDS = 300.0
 
 ANALYSIS_FRAME_MAX_WIDTH = 640
 CONTACT_THUMB_WIDTH = 320
-BANDWIDTH_MAX_SIDE = 960
 
 SKIP_ALREADY_PROCESSED = False
 DEFAULT_WORKERS = max(1, min(4, os.cpu_count() or 1))
@@ -130,8 +130,6 @@ class Thresholds:
     dark_mean_brightness: float = 20.0
     flat_std_max: float = 8.0
     score_cap: float = 100.0
-    upscale_bandwidth_max: float = 0.66
-    bandwidth_drop_db: float = 22.0
     combing_min: float = 0.12
     halo_flag: float = 8.0
     vr_min_width: int = 3840
@@ -139,6 +137,22 @@ class Thresholds:
     unstable_blur_cv: float = 1.0
     unstable_min_frames: int = 8
     pair_duration_seconds: float = 1.0
+    pair_ssim_align: float = 0.60
+    pair_align_fail_fraction: float = 0.34
+    pair_min_frames: int = 4
+    pair_blur_detail_ratio: float = 0.85
+    pair_blur_severe_ratio: float = 0.65
+    pair_noise_drop_ratio: float = 0.85
+    pair_noise_ratio: float = 1.30
+    pair_block_delta: float = 0.10
+    pair_halo_ratio: float = 1.45
+    pair_halo_delta: float = 4.0
+    pair_blur_vs_base: float = 1.15
+    pair_luma_shift: float = 10.0
+    pair_chroma_shift: float = 8.0
+    geometry_aspect_tolerance: float = 0.05
+    geometry_fit_tolerance: float = 0.03
+    geometry_crop_area_max: float = 0.10
     codec_efficiency: dict = field(default_factory=lambda: dict(CODEC_EFFICIENCY))
 
 
@@ -177,7 +191,9 @@ CSV_COLUMNS = [
     "display_height",
     "content_width",
     "content_height",
+    "content_aspect",
     "crop",
+    "fix_geometry",
     "sample_aspect_ratio",
     "rotation",
     "codec",
@@ -212,9 +228,6 @@ CSV_COLUMNS = [
     "median_noise_score",
     "avg_halo_score",
     "combing_score",
-    "effective_bandwidth",
-    "effective_height",
-    "upscale_suspected",
     "avg_brightness",
     "avg_black_frame_ratio",
     "bitrate_per_pixel",
@@ -226,7 +239,6 @@ CSV_COLUMNS = [
     "score_bitrate",
     "quality_issue_score",
     "resolution_class",
-    "effective_resolution_class",
     "blur_class",
     "blockiness_class",
     "issue_flags",
@@ -246,16 +258,24 @@ GROUP_COLUMNS = [
     "other_filename",
     "duration_delta",
     "duration_mismatch",
-    "sar_mismatch",
+    "geometry_mismatch",
     "original_display",
     "other_display",
-    "blur_delta",
-    "noise_delta",
-    "blockiness_delta",
-    "halo_delta",
+    "original_content",
+    "other_content",
+    "blur_native",
+    "blur_vs_base",
+    "block_native",
+    "noise_native",
+    "halo_vs_base",
     "ssim",
-    "psnr",
+    "luma_delta",
+    "chroma_delta",
+    "range_shift",
+    "aligned_frames",
+    "dropped_frames",
     "verdict",
+    "action",
     "best_version",
     "note",
 ]
@@ -524,7 +544,6 @@ def base_row(video_path, meta=None, processed=False):
         folder=str(path.parent),
         is_probably_processed=bool(processed),
         is_vr=False,
-        upscale_suspected=False,
         sampled_frames=0,
         frames_used=0,
         frames_excluded=0,
@@ -611,11 +630,16 @@ def parse_simple_yaml(text):
     return root
 
 
+# Removed in schema 3. Old config files may still name them.
+_RETIRED_CONFIG_KEYS = {"upscale_bandwidth_max", "bandwidth_drop_db"}
+
+
 def thresholds_from_mapping(mapping, base=None):
     """Overlay a config mapping on the built-in thresholds."""
     base = base or Thresholds()
     if not mapping:
         return base
+    mapping = {key: value for key, value in mapping.items() if key not in _RETIRED_CONFIG_KEYS}
     unknown = sorted(key for key in mapping if key not in {item.name for item in fields(base)})
     if unknown:
         raise ValueError("Unknown config keys: " + ", ".join(unknown))
@@ -778,8 +802,8 @@ def seek_points(timestamp):
     return pre, fine
 
 
-def build_frame_command(video_path, timestamp, threads=0):
-    """ffmpeg command for one full-resolution raw frame.
+def build_frame_command(video_path, timestamp, threads=0, frame_count=1):
+    """ffmpeg command for one or more full-resolution raw frames.
 
     ``-ss`` before ``-i`` jumps near the timestamp. ``-ss`` after ``-i``
     decodes to the exact time so the sample is not just the nearest
@@ -787,6 +811,7 @@ def build_frame_command(video_path, timestamp, threads=0):
     grid blockiness is measured on. There is no scale and no JPEG.
     """
     pre, fine = seek_points(timestamp)
+    count = max(1, int(frame_count))
     cmd = [
         "ffmpeg",
         "-nostdin",
@@ -801,7 +826,7 @@ def build_frame_command(video_path, timestamp, threads=0):
         "-i", str(video_path),
         "-ss", f"{fine:.3f}",
         "-map", "0:v:0",
-        "-frames:v", "1",
+        "-frames:v", str(count),
         "-an",
         "-sn",
         "-f", "rawvideo",
@@ -811,12 +836,17 @@ def build_frame_command(video_path, timestamp, threads=0):
     return cmd
 
 
-def decode_frame(video_path, timestamp, width, height, timeout, threads):
-    """Return (bgr_frame, error). error is empty on success."""
+def decode_frames(video_path, timestamp, width, height, timeout, threads, frame_count=1):
+    """Return (frames, error). error is empty when at least one frame decoded."""
     if width <= 0 or height <= 0 or width > 16384 or height > 16384:
-        return None, f"Refusing to decode frame size {width}x{height}"
+        return [], f"Refusing to decode frame size {width}x{height}"
 
-    cmd = build_frame_command(video_path, timestamp, threads=threads)
+    cmd = build_frame_command(
+        video_path,
+        timestamp,
+        threads=threads,
+        frame_count=frame_count,
+    )
     try:
         result = subprocess.run(
             cmd,
@@ -826,20 +856,33 @@ def decode_frame(video_path, timestamp, width, height, timeout, threads):
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return None, f"Timed out decoding frame at {float(timestamp):.2f}s"
+        return [], f"Timed out decoding frame at {float(timestamp):.2f}s"
 
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", "replace").strip()
-        return None, err or f"ffmpeg failed at {float(timestamp):.2f}s"
+        return [], err or f"ffmpeg failed at {float(timestamp):.2f}s"
 
-    expected = int(width) * int(height) * 3
-    if len(result.stdout) != expected:
-        return None, (
+    frame_bytes = int(width) * int(height) * 3
+    if len(result.stdout) < frame_bytes:
+        return [], (
             f"Unexpected frame size {len(result.stdout)} "
-            f"(expected {expected}) at {float(timestamp):.2f}s"
+            f"(expected {frame_bytes}) at {float(timestamp):.2f}s"
         )
-    frame = np.frombuffer(result.stdout, dtype=np.uint8).reshape((int(height), int(width), 3))
-    return frame.copy(), ""
+    got = len(result.stdout) // frame_bytes
+    frames = []
+    for index in range(got):
+        start = index * frame_bytes
+        raw = np.frombuffer(result.stdout[start:start + frame_bytes], dtype=np.uint8)
+        frames.append(raw.reshape((int(height), int(width), 3)).copy())
+    return frames, ""
+
+
+def decode_frame(video_path, timestamp, width, height, timeout, threads):
+    """Return (bgr_frame, error). error is empty on success."""
+    frames, error = decode_frames(video_path, timestamp, width, height, timeout, threads, 1)
+    if not frames:
+        return None, error or f"ffmpeg failed at {float(timestamp):.2f}s"
+    return frames[0], ""
 
 
 def extract_sample_frames(video_path, meta, config, sample_count=None, seed=None):
@@ -970,6 +1013,43 @@ def blockiness_score(frame):
     return float(boundary_mean / max(non_boundary_mean, 1e-6))
 
 
+def _block_period(scale):
+    """8x8 codec grid after a resize. Near 1x stays on the original period."""
+    if abs(float(scale) - 1.0) < 0.08:
+        return 8
+    return max(2, int(round(8.0 * float(scale))))
+
+
+def blockiness_scaled(frame, scale_x=1.0, scale_y=1.0):
+    """Blockiness on the codec grid after a resize, measured from frame origin.
+
+    A 1.5x upscale turns 8x8 blocks into 12x12 blocks. Measuring that frame
+    on an 8-pixel period misses them. The coded frame is not cropped first,
+    so the grid still starts at pixel 0.
+    """
+    gray = to_gray(frame).astype(np.float32)
+    height, width = gray.shape[:2]
+    if height < 16 or width < 16:
+        return 0.0
+    diff_x = np.abs(gray[:, 1:] - gray[:, :-1])
+    diff_y = np.abs(gray[1:, :] - gray[:-1, :])
+    period_x = _block_period(scale_x)
+    period_y = _block_period(scale_y)
+    cols = np.arange(period_x - 1, diff_x.shape[1], period_x)
+    rows = np.arange(period_y - 1, diff_y.shape[0], period_y)
+    if cols.size < 2 or rows.size < 2:
+        return 0.0
+    boundary = (float(diff_x[:, cols].mean()) + float(diff_y[rows, :].mean())) / 2.0
+    mask_x = np.ones(diff_x.shape[1], dtype=bool)
+    mask_y = np.ones(diff_y.shape[0], dtype=bool)
+    mask_x[cols] = False
+    mask_y[rows] = False
+    if not mask_x.any() or not mask_y.any():
+        return 0.0
+    interior = (float(diff_x[:, mask_x].mean()) + float(diff_y[mask_y, :].mean())) / 2.0
+    return float(boundary / max(interior, 1e-6))
+
+
 def noise_profile(frame):
     """Mean absolute residual after a 3x3 median blur, on 8-bit pixels."""
     gray = to_gray(frame)
@@ -1057,59 +1137,6 @@ def combing_score(gray):
     return float(np.mean(inter > (intra + 12.0)))
 
 
-def effective_bandwidth(gray, drop_db=22.0, max_side=BANDWIDTH_MAX_SIDE):
-    """Fraction of Nyquist that still carries detail.
-
-    The radial spectrum is compared with its own low-frequency level.
-    White noise and sharp frames stay near 1. A strong lowpass, including
-    a cubic upscale of a much smaller frame, falls earlier. The number is
-    an estimate: mild upscales and mild defocus can land in the same range.
-    """
-    g = np.asarray(to_gray(gray), np.float32)
-    height, width = g.shape[:2]
-    if height < 16 or width < 16:
-        return None
-    long_side = max(height, width)
-    if long_side > max_side:
-        scale = max_side / float(long_side)
-        g = cv2.resize(
-            g,
-            (max(2, int(round(width * scale))), max(2, int(round(height * scale)))),
-            interpolation=cv2.INTER_AREA,
-        )
-        height, width = g.shape[:2]
-    window = np.outer(np.hanning(height), np.hanning(width)).astype(np.float32)
-    centered = g - float(g.mean())
-    power = np.abs(np.fft.fftshift(np.fft.fft2(centered * window))) ** 2
-    cy = (height - 1) / 2.0
-    cx = (width - 1) / 2.0
-    yy, xx = np.indices(power.shape)
-    radius = np.hypot(yy - cy, xx - cx).astype(np.int32)
-    limit = min(height, width) // 2
-    if limit < 16:
-        return None
-    counts = np.bincount(radius.ravel())[:limit]
-    sums = np.bincount(radius.ravel(), weights=power.ravel())[:limit]
-    mean = sums / np.maximum(counts, 1)
-    bins = 32
-    edges = np.linspace(0, len(mean), bins + 1).astype(int)
-    levels = []
-    for start, stop in zip(edges[:-1], edges[1:]):
-        chunk = mean[max(int(start), 1):max(int(stop), int(start) + 1)]
-        levels.append(float(np.median(chunk)) if chunk.size else 0.0)
-    levels = np.asarray(levels, dtype=np.float64) + 1e-12
-    reference = float(np.median(levels[2:6]))
-    if reference <= 0:
-        return None
-    decibels = 10.0 * np.log10(levels / reference)
-    if float(np.median(decibels[int(bins * 0.75):])) >= -float(drop_db):
-        return 1.0
-    above = np.flatnonzero(decibels >= -float(drop_db))
-    if above.size == 0:
-        return 0.0
-    return float((int(above.max()) + 0.5) / bins)
-
-
 def letterbox_bounds(frame, thresh=16):
     """Crop rectangle (x, y, w, h) for black bars on the outer edges."""
     gray = to_gray(frame)
@@ -1145,22 +1172,15 @@ def letterbox_bounds(frame, thresh=16):
     return (left, top, crop_w, crop_h)
 
 
-def consensus_letterbox(frames, thresh=16):
-    """One crop for the file, from the frames that actually show bars."""
-    if not frames:
-        return (0, 0, 0, 0)
-    boxes = [letterbox_bounds(frame, thresh) for frame in frames]
-    gray = to_gray(frames[0])
-    height, width = gray.shape[:2]
-    real = [
-        box for box in boxes
-        if not (box[0] == 0 and box[1] == 0 and box[2] == width and box[3] == height)
-    ]
-    chosen = real or boxes
-    left = int(np.median([box[0] for box in chosen]))
-    top = int(np.median([box[1] for box in chosen]))
-    right = int(np.median([box[0] + box[2] for box in chosen]))
-    bottom = int(np.median([box[1] + box[3] for box in chosen]))
+def _boxes_near(left, right, tol=8):
+    return all(abs(int(left[index]) - int(right[index])) <= tol for index in range(4))
+
+
+def _median_box(boxes, width, height):
+    left = int(np.median([box[0] for box in boxes]))
+    top = int(np.median([box[1] for box in boxes]))
+    right = int(np.median([box[0] + box[2] for box in boxes]))
+    bottom = int(np.median([box[1] + box[3] for box in boxes]))
     left = max(0, min(left, width - 16))
     top = max(0, min(top, height - 16))
     right = max(left + 16, min(right, width))
@@ -1168,6 +1188,136 @@ def consensus_letterbox(frames, thresh=16):
     if (bottom - top) < height * 0.5 or (right - left) < width * 0.5:
         return (0, 0, width, height)
     return (left, top, right - left, bottom - top)
+
+
+def consensus_letterbox(frames, thresh=16, dark_mean=20.0):
+    """One crop for the file, from non-dark frames that agree on the bars.
+
+    A crop is kept only when it matches at least half of the frames that
+    are bright enough to show a bar. One dark scene cannot set the crop.
+    """
+    if not frames:
+        return (0, 0, 0, 0)
+    gray = to_gray(frames[0])
+    height, width = gray.shape[:2]
+    full = (0, 0, width, height)
+    usable = []
+    for frame in frames:
+        picture = to_gray(frame)
+        if float(np.mean(picture)) <= float(dark_mean):
+            continue
+        usable.append(picture)
+    if not usable:
+        return full
+    boxes = [letterbox_bounds(picture, thresh) for picture in usable]
+    best = full
+    best_count = sum(1 for box in boxes if _boxes_near(box, full))
+    real = [box for box in boxes if not _boxes_near(box, full, tol=2)]
+    if real:
+        candidate = _median_box(real, width, height)
+        count = sum(1 for box in boxes if _boxes_near(box, candidate))
+        if count > best_count:
+            best = candidate
+            best_count = count
+    if best_count * 2 < len(usable):
+        return full
+    return best
+
+
+def even_dim(value):
+    """Even pixel size, the size yuv420 encoders want."""
+    number = max(2, int(round(float(value))))
+    if number % 2:
+        number += 1
+    return number
+
+
+def area_loss_to_16x9(aspect):
+    """Fraction of the picture removed by a center crop to 16:9."""
+    target = 16.0 / 9.0
+    if aspect is None or aspect <= 0:
+        return 1.0
+    if aspect >= target:
+        return 1.0 - (target / float(aspect))
+    return 1.0 - (float(aspect) / target)
+
+
+def geometry_canvas(display_w, display_h):
+    """Standard 16:9 frame for HD content. SD stays at its own size."""
+    short_side = min(display_w, display_h)
+    long_side = max(display_w, display_h)
+    if short_side >= 900 or long_side >= 1600:
+        return (1920, 1080)
+    if short_side >= 600 or long_side >= 1100:
+        return (1280, 720)
+    return None
+
+
+def geometry_plan(frame_w, frame_h, crop, sar=1.0, rotation=0.0, vr=False, thresholds=None):
+    """Label for a re-encode that clears bars, SAR, and a non-16:9 frame.
+
+    The label is empty when the content is already square-pixel 16:9.
+    SD is padded or cropped at its own display size. 720p and 1080p
+    content use a 1280x720 or 1920x1080 canvas. The picture is not
+    upscaled just to reach that canvas: a 4:3 SD frame is padded.
+    """
+    limits = active_thresholds(thresholds)
+    if vr or frame_w <= 0 or frame_h <= 0 or not crop:
+        return ""
+    _x, _y, crop_w, crop_h = [int(value) for value in crop]
+    display_w, display_h = display_dimensions(crop_w, crop_h, float(sar or 1.0), rotation)
+    if display_w <= 0 or display_h <= 0:
+        return ""
+    aspect = float(display_w) / float(display_h)
+    target = 16.0 / 9.0
+    relative = abs(aspect - target) / target
+    loss = area_loss_to_16x9(aspect)
+    if relative <= limits.geometry_fit_tolerance:
+        mode = "fit"
+    elif loss <= limits.geometry_crop_area_max:
+        mode = "crop"
+    else:
+        mode = "pad"
+
+    canvas = geometry_canvas(display_w, display_h)
+    if canvas is None:
+        if mode == "pad":
+            if aspect >= target:
+                target_w = even_dim(display_w)
+                target_h = even_dim(display_w / target)
+            else:
+                target_h = even_dim(display_h)
+                target_w = even_dim(display_h * target)
+        elif mode == "crop":
+            if aspect >= target:
+                target_h = even_dim(display_h)
+                target_w = even_dim(display_h * target)
+            else:
+                target_w = even_dim(display_w)
+                target_h = even_dim(display_w / target)
+        else:
+            target_w, target_h = even_dim(display_w), even_dim(display_h)
+    else:
+        target_w, target_h = canvas
+
+    bars = crop_w <= int(frame_w) - 4 or crop_h <= int(frame_h) - 4
+    sar_off = abs(float(sar or 1.0) - 1.0) > 0.01
+    parts = []
+    if bars:
+        parts.append("crop_bars")
+    if mode == "pad" and relative > limits.geometry_fit_tolerance:
+        parts.append("pad_to_16x9")
+    elif mode == "crop" and relative > limits.geometry_fit_tolerance:
+        parts.append("crop_to_16x9")
+    elif mode == "fit" and (
+        abs(target_w - display_w) > 4 or abs(target_h - display_h) > 4
+    ):
+        parts.append("fit_16x9")
+    if sar_off:
+        parts.append("reset_sar")
+    if not parts:
+        return ""
+    return "+".join(parts) + f":{target_w}x{target_h}"
 
 
 def center_window(width, height, fraction=0.5):
@@ -1231,8 +1381,8 @@ def brightness_score(frame):
 def measure_frame(frame, max_width=ANALYSIS_FRAME_MAX_WIDTH, crop=None, block_crop=None, thresholds=None):
     """Metrics for one decoded frame.
 
-    Blur, noise, halo, and bandwidth use the active picture. Blockiness
-    stays on the coded grid unless ``block_crop`` is set (VR center).
+    Blur, noise, and halo use the active picture. Blockiness stays on the
+    coded grid unless ``block_crop`` is set (VR center).
     """
     limits = active_thresholds(thresholds)
     gray_full = to_gray(frame)
@@ -1248,7 +1398,6 @@ def measure_frame(frame, max_width=ANALYSIS_FRAME_MAX_WIDTH, crop=None, block_cr
     )
     blur, ratio = blur_profile(content, max_width)
     scaled = scale_gray(content, max_width)
-    bandwidth = effective_bandwidth(content, drop_db=limits.bandwidth_drop_db)
     return {
         "blur": blur,
         "blur_scale_ratio": ratio,
@@ -1258,7 +1407,6 @@ def measure_frame(frame, max_width=ANALYSIS_FRAME_MAX_WIDTH, crop=None, block_cr
         "noise_sigma": noise_sigma(content),
         "halo": halo_score(content),
         "combing": combing_score(gray_full),
-        "bandwidth": bandwidth,
         "brightness": brightness,
         "black": black,
         "std": std,
@@ -1299,7 +1447,7 @@ def _values(items, key):
     return found
 
 
-def aggregate_metrics(measured, content_short_side=None):
+def aggregate_metrics(measured):
     """Robust blur stats, plus mean blockiness and a median noise sigma.
 
     Near-black, flat, and duplicate samples are left out of the picture
@@ -1348,18 +1496,11 @@ def aggregate_metrics(measured, content_short_side=None):
 
     ratios = _values(chosen, "blur_scale_ratio")
     sigmas = _values(chosen, "noise_sigma")
-    # A black or flat sample has no spectrum worth reading.
-    bandwidths = [] if mostly_dark else _values(chosen, "bandwidth")
     halos = _values(chosen, "halo")
     combing = _values(chosen, "combing")
     tiles = _values(chosen, "blur_best_tiles")
     blocks = _values(chosen, "block")
     noises = _values(chosen, "noise")
-
-    bandwidth = float(np.median(bandwidths)) if bandwidths else None
-    effective_height = None
-    if bandwidth is not None and content_short_side:
-        effective_height = float(bandwidth) * float(content_short_side)
 
     dark_count = sum(1 for item in measured if item.get("exclude_dark"))
     duplicate_count = sum(
@@ -1382,8 +1523,6 @@ def aggregate_metrics(measured, content_short_side=None):
         "combing": float(np.median(combing)) if combing else None,
         "blur_best_tiles": float(np.median(tiles)) if tiles else None,
         "blur_scale_ratio": float(np.mean(ratios)) if ratios else None,
-        "bandwidth": bandwidth,
-        "effective_height": effective_height,
         "avg_brightness": float(np.mean(_values(measured, "brightness"))),
         "avg_black": float(np.mean(_values(measured, "black"))),
         "frames_used": len(chosen),
@@ -1423,15 +1562,6 @@ def ssim_gray(first, second):
     numerator = (2 * mu_a * mu_b + c1) * (2 * sigma_ab + c2)
     denominator = (mu_a ** 2 + mu_b ** 2 + c1) * (sigma_a + sigma_b + c2)
     return float(np.mean(numerator / denominator))
-
-
-def psnr_gray(first, second):
-    if first.shape != second.shape:
-        return None
-    mse = float(np.mean((first.astype(np.float64) - second.astype(np.float64)) ** 2))
-    if mse <= 1e-12:
-        return 100.0
-    return float(10.0 * math.log10((255.0 ** 2) / mse))
 
 
 # ============================================================
@@ -1616,16 +1746,6 @@ def calculate_issue_score(
     return round(min(limits.score_cap, float(total)), 2)
 
 
-def upscale_suspected(short_side_px, avg_blur, bandwidth, thresholds=None):
-    """HD container whose spectrum and sharpness both look like a smaller source."""
-    limits = active_thresholds(thresholds)
-    if short_side_px < 720 or bandwidth is None or avg_blur is None:
-        return False
-    if float(avg_blur) >= limits.blur_slightly_soft:
-        return False
-    return float(bandwidth) <= limits.upscale_bandwidth_max
-
-
 def build_issue_flags(
     short_side_px,
     avg_blur,
@@ -1637,7 +1757,6 @@ def build_issue_flags(
     blur_scale_ratio=None,
     codec=None,
     vr=False,
-    upscale=False,
     combed=False,
     halo=None,
     unstable=False,
@@ -1650,8 +1769,6 @@ def build_issue_flags(
         flags.append("already_processed_name")
     if vr:
         flags.append("vr_equirect")
-    if upscale:
-        flags.append("upscale_suspected")
 
     resolution_class = classify_resolution(short_side_px, vr=vr)
     if resolution_class in {"very_tiny", "very_low_resolution", "low_resolution", "sd_plus"}:
@@ -1708,8 +1825,6 @@ def assign_recommendation(
     median_noise=None,
     blur_scale_ratio=None,
     mostly_dark=False,
-    upscale=False,
-    effective_side=None,
     combed=False,
     vr=False,
     unstable=False,
@@ -1717,16 +1832,12 @@ def assign_recommendation(
 ):
     """Pick a review label from the same thresholds as the score.
 
-    An upscale suspicion judges the low-resolution branches with the
-    effective short side. A blurry HD file that is not an upscale gets
-    its own label instead of ``low_priority_or_ok``.
+    Resolution uses the active picture. A blurry HD file is checked as a
+    source or denoise problem. It is not sent through an upscale step.
     """
     limits = active_thresholds(thresholds)
-    judge_side = side
-    if upscale and effective_side and 0 < float(effective_side) < float(side or 0):
-        judge_side = float(effective_side)
-    low_res = 0 < judge_side <= 576
-    very_low_res = 0 < judge_side <= 360
+    low_res = side is not None and 0 < side <= 576
+    very_low_res = side is not None and 0 < side <= 360
     blurry = avg_blur is not None and avg_blur < limits.blur_soft
     very_blurry = avg_blur is not None and avg_blur < limits.blur_blurry
     slightly_soft = (
@@ -1754,7 +1865,7 @@ def assign_recommendation(
         base = "artifact_reduction_review"
     elif grain_dominated or (high_grain and low_res):
         base = "manual_review"
-    elif (not upscale) and side is not None and side >= 720 and blurry:
+    elif side is not None and side >= 720 and blurry:
         base = "check_source_upscaled_or_denoise"
     elif score is not None and score >= 45:
         base = "manual_review"
@@ -2041,10 +2152,15 @@ def analyze_video(video_path, config=None):
         crop = center_window(meta["width"], meta["height"])
         block_crop = crop
     else:
-        crop = consensus_letterbox([frame for _timestamp, frame in frames])
+        crop = consensus_letterbox(
+            [frame for _timestamp, frame in frames],
+            dark_mean=limits.dark_mean_brightness,
+        )
         block_crop = None
-    content_w, content_h = display_dimensions(crop[2], crop[3], parse_sar(meta["sample_aspect_ratio"]), meta["rotation"])
+    sar = parse_sar(meta["sample_aspect_ratio"])
+    content_w, content_h = display_dimensions(crop[2], crop[3], sar, meta["rotation"])
     side = short_side(crop[2], crop[3], content_w, content_h)
+    aspect = (float(content_w) / float(content_h)) if content_w and content_h else None
     measured = [
         measure_frame(
             frame,
@@ -2056,7 +2172,7 @@ def analyze_video(video_path, config=None):
         for _timestamp, frame in frames
     ]
     mark_duplicate_frames(measured, frames, crop)
-    stats = aggregate_metrics(measured, content_short_side=side)
+    stats = aggregate_metrics(measured)
     container_side = short_side(
         meta["width"],
         meta["height"],
@@ -2070,22 +2186,12 @@ def analyze_video(video_path, config=None):
         meta["bit_rate"], meta["width"], meta["height"]
     )
     bpp_eff = None if bpp_frame is None else bpp_frame * codec_efficiency(meta["codec"], limits)
-    suspected = (not stats["mostly_dark"]) and upscale_suspected(
-        container_side,
-        stats["avg_blur"],
-        stats["bandwidth"],
-        limits,
-    )
-    judge_side = side
-    if suspected and stats["effective_height"] and 0 < stats["effective_height"] < side:
-        judge_side = stats["effective_height"]
     blur_for_score = None if stats["mostly_dark"] else stats["avg_blur"]
     block_for_score = None if stats["mostly_dark"] else stats["avg_block"]
-    # Resolution follows the active picture, or the effective short side
-    # when the container looks upscaled. Bitrate keeps the container side,
-    # because that is the grid the codec stored.
+    # Resolution follows the active picture. Bitrate keeps the container
+    # side, because that is the grid the codec stored.
     parts = issue_score_parts(
-        judge_side if suspected else side,
+        side,
         blur_for_score,
         block_for_score,
         bpp_frame,
@@ -2123,7 +2229,6 @@ def analyze_video(video_path, config=None):
         blur_scale_ratio=stats["blur_scale_ratio"],
         codec=meta["codec"],
         vr=vr,
-        upscale=suspected,
         combed=combed,
         halo=stats["avg_halo"],
         unstable=unstable,
@@ -2139,8 +2244,6 @@ def analyze_video(video_path, config=None):
         median_noise=stats["median_noise"],
         blur_scale_ratio=stats["blur_scale_ratio"],
         mostly_dark=stats["mostly_dark"],
-        upscale=suspected,
-        effective_side=stats["effective_height"],
         combed=combed,
         vr=vr,
         unstable=unstable,
@@ -2149,7 +2252,17 @@ def analyze_video(video_path, config=None):
     row.update({
         "content_width": content_w,
         "content_height": content_h,
+        "content_aspect": round_or_none(aspect, 4),
         "crop": ",".join(str(int(value)) for value in crop),
+        "fix_geometry": geometry_plan(
+            meta["width"],
+            meta["height"],
+            crop,
+            sar=sar,
+            rotation=meta["rotation"],
+            vr=vr,
+            thresholds=limits,
+        ),
         "frames_used": stats["frames_used"],
         "frames_excluded": stats["frames_excluded"],
         "avg_blur_score": round_or_none(stats["avg_blur"], 3),
@@ -2167,9 +2280,6 @@ def analyze_video(video_path, config=None):
         "median_noise_score": round_or_none(stats["median_noise"], 3),
         "avg_halo_score": round_or_none(stats["avg_halo"], 3),
         "combing_score": round_or_none(stats["combing"], 4),
-        "effective_bandwidth": round_or_none(stats["bandwidth"], 3),
-        "effective_height": round_or_none(stats["effective_height"], 1),
-        "upscale_suspected": bool(suspected),
         "avg_brightness": round_or_none(stats["avg_brightness"], 3),
         "avg_black_frame_ratio": round_or_none(stats["avg_black"], 4),
         "bitrate_per_pixel": round_or_none(bpp_second, 6),
@@ -2181,7 +2291,6 @@ def analyze_video(video_path, config=None):
         "score_bitrate": parts["score_bitrate"],
         "quality_issue_score": score,
         "resolution_class": classify_resolution(side, vr=vr),
-        "effective_resolution_class": classify_resolution(stats["effective_height"] or 0),
         "blur_class": classify_blur(stats["avg_blur"], stats["blur_scale_ratio"], limits),
         "blockiness_class": classify_blockiness(stats["avg_block"], limits),
         "issue_flags": ",".join(flags),
@@ -2310,9 +2419,18 @@ def display_aspect(row):
     return width / height
 
 
-def aspects_mismatch(left, right, tolerance=0.02):
-    aspect_left = display_aspect(left)
-    aspect_right = display_aspect(right)
+def row_content_aspect(row):
+    """Aspect of the active picture. Display size is only a fallback."""
+    width = safe_float(row.get("content_width"))
+    height = safe_float(row.get("content_height"))
+    if width > 0 and height > 0:
+        return width / height
+    return display_aspect(row)
+
+
+def aspects_mismatch(left, right, tolerance=0.05):
+    aspect_left = row_content_aspect(left)
+    aspect_right = row_content_aspect(right)
     if aspect_left is None or aspect_right is None:
         return False
     return abs(aspect_left - aspect_right) / max(aspect_left, aspect_right) > tolerance
@@ -2373,30 +2491,62 @@ def group_key(folder, duration):
     return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()[:12]
 
 
-def _metric(stats, median_key, avg_key):
-    value = stats.get(median_key)
-    if value is None:
-        value = stats.get(avg_key)
-    return value
+def to_bgr(frame):
+    if frame.ndim == 2 or frame.shape[2] == 1:
+        gray = frame if frame.ndim == 2 else frame[:, :, 0]
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return frame
 
 
-def display_bgr(frame, sar, rotation):
-    image = frame
-    if abs(float(sar) - 1.0) > 0.01:
-        height, width = image.shape[:2]
-        image = cv2.resize(
-            image,
-            (max(1, int(round(width * float(sar)))), height),
-            interpolation=cv2.INTER_AREA,
-        )
+def rotate_bgr(image, rotation):
     turns = int(round(abs(float(rotation)))) % 360
     if turns == 90:
-        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    elif turns == 180:
-        image = cv2.rotate(image, cv2.ROTATE_180)
-    elif turns == 270:
-        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if turns == 180:
+        return cv2.rotate(image, cv2.ROTATE_180)
+    if turns == 270:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
     return image
+
+
+def content_bgr(frame, crop, sar, rotation):
+    """Active picture in square pixels, bars removed, then rotated."""
+    image = to_bgr(frame)
+    height, width = image.shape[:2]
+    if crop is None:
+        view = image
+    else:
+        x, y, crop_w, crop_h = [int(value) for value in crop]
+        x = max(0, min(x, max(0, width - 1)))
+        y = max(0, min(y, max(0, height - 1)))
+        view = image[y:y + max(0, crop_h), x:x + max(0, crop_w)]
+        if view.size == 0:
+            view = image
+    if abs(float(sar) - 1.0) > 0.01:
+        view = cv2.resize(
+            view,
+            (max(1, int(round(view.shape[1] * float(sar)))), view.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+    return rotate_bgr(view, rotation)
+
+
+def parse_crop(text, width, height):
+    width = int(width or 0)
+    height = int(height or 0)
+    fallback = (0, 0, width, height)
+    if text is None or str(text).strip() == "":
+        return fallback
+    parts = str(text).split(",")
+    if len(parts) != 4:
+        return fallback
+    try:
+        x, y, crop_w, crop_h = [int(float(part)) for part in parts]
+    except ValueError:
+        return fallback
+    if crop_w <= 1 or crop_h <= 1:
+        return fallback
+    return (x, y, crop_w, crop_h)
 
 
 def _row_meta(row):
@@ -2407,31 +2557,263 @@ def _row_meta(row):
     }
 
 
-def pair_picture_stats(frames, config):
-    crop = consensus_letterbox([frame for _timestamp, frame in frames])
-    limits = config.thresholds or DEFAULT_THRESHOLDS
-    measured = [
-        measure_frame(frame, config.analysis_frame_max_width, crop=crop, thresholds=limits)
-        for _timestamp, frame in frames
-    ]
-    mark_duplicate_frames(measured, frames, crop)
-    height, width = to_gray(frames[0][1]).shape[:2]
-    content_w, content_h = crop[2], crop[3]
-    side = min(content_w, content_h) if content_w and content_h else min(width, height)
-    return aggregate_metrics(measured, content_short_side=side), crop
+def _resize_image(image, width, height, interpolation):
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if image.shape[1] == width and image.shape[0] == height:
+        return image
+    return cv2.resize(image, (width, height), interpolation=interpolation)
+
+
+def safe_ratio(numerator, denominator, floor=1.0):
+    """Ratio that stays 1 when both sides are below the noise floor."""
+    num = float(numerator or 0.0)
+    den = float(denominator or 0.0)
+    if den < floor and num < floor:
+        return 1.0
+    return num / max(den, floor)
+
+
+def mean_yuv(bgr):
+    yuv = cv2.cvtColor(to_bgr(bgr), cv2.COLOR_BGR2YUV)
+    return [float(yuv[:, :, channel].mean()) for channel in range(3)]
+
+
+def shift_luma(bgr, delta):
+    if abs(float(delta)) < 0.5:
+        return to_bgr(bgr)
+    yuv = cv2.cvtColor(to_bgr(bgr), cv2.COLOR_BGR2YUV).astype(np.int16)
+    yuv[:, :, 0] = np.clip(yuv[:, :, 0] + int(round(float(delta))), 0, 255)
+    return cv2.cvtColor(yuv.astype(np.uint8), cv2.COLOR_YUV2BGR)
+
+
+def align_ssim(first, second, width=160):
+    """SSIM after both pictures are fit to a small common width."""
+    left = to_gray(first)
+    right = to_gray(second)
+    if left.shape[1] < 16 or right.shape[1] < 16 or left.shape[0] < 16 or right.shape[0] < 16:
+        return None
+    left_h = max(16, int(round(left.shape[0] * (width / float(left.shape[1])))))
+    right_h = max(16, int(round(right.shape[0] * (width / float(right.shape[1])))))
+    left_small = cv2.resize(left, (width, left_h), interpolation=cv2.INTER_AREA)
+    right_small = cv2.resize(right, (width, right_h), interpolation=cv2.INTER_AREA)
+    if right_small.shape != left_small.shape:
+        right_small = cv2.resize(
+            right_small,
+            (left_small.shape[1], left_small.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+    return ssim_gray(left_small, right_small)
+
+
+def evaluate_pair_frames(
+    orig_frame,
+    proc_frame,
+    orig_crop=None,
+    proc_crop=None,
+    orig_sar=1.0,
+    proc_sar=1.0,
+    orig_rotation=0.0,
+    proc_rotation=0.0,
+):
+    """One timestamp: native-grid damage test and bicubic baseline test.
+
+    Native sharpness is the processed frame, downscaled to the original
+    content size, divided by the same roundtrip of a bicubic upscale.
+    Comparing with the original itself treats the resampling loss of a
+    plain upscale as lost detail. The baseline test asks whether the
+    processed frame is sharper than that bicubic upscale on the output canvas.
+    Blockiness uses the scaled codec period on the coded frame, because an
+    8x8 grid is no longer 8 pixels after an upscale.
+    """
+    orig_view = content_bgr(orig_frame, orig_crop, orig_sar, orig_rotation)
+    proc_view = content_bgr(proc_frame, proc_crop, proc_sar, proc_rotation)
+    if min(orig_view.shape[:2]) < 16 or min(proc_view.shape[:2]) < 16:
+        return None
+    orig_yuv = mean_yuv(orig_view)
+    proc_yuv = mean_yuv(proc_view)
+    luma_delta = orig_yuv[0] - proc_yuv[0]
+    chroma_delta = max(abs(orig_yuv[1] - proc_yuv[1]), abs(orig_yuv[2] - proc_yuv[2]))
+    if abs(luma_delta) >= 10.0:
+        proc_view = shift_luma(proc_view, luma_delta)
+    orig_h, orig_w = orig_view.shape[:2]
+    proc_h, proc_w = proc_view.shape[:2]
+    # Resize the color picture, then measure gray. A player upscale does
+    # the same, so a plain bicubic file matches this baseline.
+    base_view = _resize_image(orig_view, proc_w, proc_h, cv2.INTER_CUBIC)
+    orig_gray = to_gray(orig_view)
+    proc_gray = to_gray(proc_view)
+    base = to_gray(base_view)
+    proc_native = _resize_image(proc_gray, orig_w, orig_h, cv2.INTER_AREA)
+    base_native = _resize_image(base, orig_w, orig_h, cv2.INTER_AREA)
+    orig_coded_h, orig_coded_w = to_gray(orig_frame).shape[:2]
+    proc_coded_h, proc_coded_w = to_gray(proc_frame).shape[:2]
+    scale_x = (proc_coded_w / float(orig_coded_w)) if orig_coded_w else 1.0
+    scale_y = (proc_coded_h / float(orig_coded_h)) if orig_coded_h else 1.0
+    halo_proc = halo_score(proc_gray)
+    halo_base = halo_score(base)
+    return {
+        "blur_native": safe_ratio(laplacian_var(proc_native), laplacian_var(base_native)),
+        "blur_vs_base": safe_ratio(laplacian_var(proc_gray), laplacian_var(base)),
+        "block_native": float(
+            blockiness_scaled(proc_frame, scale_x, scale_y)
+            - blockiness_scaled(orig_frame, 1.0, 1.0)
+        ),
+        "noise_native": safe_ratio(
+            noise_sigma(proc_native),
+            noise_sigma(base_native),
+            floor=0.05,
+        ),
+        "halo_vs_base": float(halo_proc) / max(float(halo_base), 1.0),
+        "halo_delta": float(halo_proc - halo_base),
+        "ssim": ssim_gray(proc_native, orig_gray),
+        "luma_delta": float(luma_delta),
+        "chroma_delta": float(chroma_delta),
+    }
+
+
+def _median_of(items, key):
+    values = []
+    for item in items:
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(number):
+            continue
+        values.append(number)
+    if not values:
+        return None
+    return float(np.median(values))
+
+
+def summarize_pair_metrics(frames, thresholds=None):
+    """Median of the per-frame deltas. Scene changes cancel out."""
+    limits = active_thresholds(thresholds)
+    summary = {
+        key: _median_of(frames, key)
+        for key in (
+            "blur_native",
+            "blur_vs_base",
+            "block_native",
+            "noise_native",
+            "halo_vs_base",
+            "halo_delta",
+            "ssim",
+            "luma_delta",
+            "chroma_delta",
+        )
+    }
+    luma = summary.get("luma_delta")
+    summary["range_shift"] = luma is not None and abs(luma) >= limits.pair_luma_shift
+    summary["pair_misaligned"] = False
+    summary["geometry_mismatch"] = False
+    return summary
+
+
+def pair_verdict(deltas, thresholds=None):
+    """Did the processed file beat a plain upscale, without damaging the source?
+
+    SSIM is an alignment gate, not a quality failure. A level shift is
+    recorded separately and removed before these ratios are measured.
+    """
+    limits = active_thresholds(thresholds)
+    if not deltas:
+        return "compare_failed"
+    if deltas.get("geometry_mismatch"):
+        return "geometry_mismatch"
+    if deltas.get("pair_misaligned"):
+        return "pair_misaligned"
+    flags = []
+    blur = deltas.get("blur_native")
+    noise = deltas.get("noise_native")
+    if blur is not None and (
+        blur < limits.pair_blur_severe_ratio
+        or (
+            blur < limits.pair_blur_detail_ratio
+            and (noise is None or noise >= limits.pair_noise_drop_ratio)
+        )
+    ):
+        flags.append("lost_detail")
+    block = deltas.get("block_native")
+    if block is not None and block > limits.pair_block_delta:
+        flags.append("more_blocky")
+    if noise is not None and noise > limits.pair_noise_ratio:
+        flags.append("more_noise")
+    halo_ratio = deltas.get("halo_vs_base")
+    halo_delta = deltas.get("halo_delta")
+    if (
+        halo_ratio is not None
+        and halo_delta is not None
+        and halo_ratio > limits.pair_halo_ratio
+        and halo_delta > limits.pair_halo_delta
+    ):
+        flags.append("oversharpened")
+    if flags:
+        return "regressed:" + "+".join(flags)
+    sharper = deltas.get("blur_vs_base")
+    if sharper is not None and sharper > limits.pair_blur_vs_base:
+        return "improved"
+    return "neutral"
+
+
+def pair_action(verdict):
+    """Which file to keep. Neutral stays with the original."""
+    if verdict == "improved":
+        return "keep_processed"
+    if verdict == "neutral" or str(verdict).startswith("regressed"):
+        return "keep_original"
+    return "manual_review"
+
+
+def _sheet_pair(left_bgr, right_bgr, height=240):
+    def fit(image):
+        picture = to_bgr(image)
+        frame_h, frame_w = picture.shape[:2]
+        if frame_h <= 0 or frame_w <= 0:
+            return picture
+        scale = height / float(frame_h)
+        return cv2.resize(
+            picture,
+            (max(1, int(round(frame_w * scale))), height),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    left = fit(left_bgr)
+    right = fit(right_bgr)
+    divider = np.full((height, 4, 3), 255, np.uint8)
+    return np.hstack([left, divider, right])
 
 
 def compare_pair(original, other, config):
-    """Sample both files at the same timestamps and score the difference."""
+    """Sample both files at the same timestamps and score aligned frames.
+
+    A timestamp whose pictures do not match is retried across two frames
+    on either side. If too many timestamps still miss, the pair is
+    misaligned and the quality verdict is not used.
+    """
+    limits = config.thresholds or DEFAULT_THRESHOLDS
     orig_meta = _row_meta(original)
     other_meta = _row_meta(other)
     duration = min(orig_meta["duration"], other_meta["duration"])
     count = min(8, resolved_sample_count(duration, config))
-    seed = path_seed(original.get("path"))
-    timestamps = sample_timestamps(duration, count, seed=seed)
-    orig_frames = []
-    other_frames = []
+    timestamps = sample_timestamps(duration, count, seed=path_seed(original.get("path")))
+    orig_crop = parse_crop(original.get("crop"), orig_meta["width"], orig_meta["height"])
+    other_crop = parse_crop(other.get("crop"), other_meta["width"], other_meta["height"])
+    orig_sar = parse_sar(original.get("sample_aspect_ratio"))
+    other_sar = parse_sar(other.get("sample_aspect_ratio"))
+    orig_rot = safe_float(original.get("rotation"))
+    other_rot = safe_float(other.get("rotation"))
+    fps = safe_float(other.get("frame_rate")) or safe_float(original.get("frame_rate")) or 30.0
+    fps = min(max(fps, 1.0), 120.0)
+    measured = []
+    sheet_frames = []
     errors = []
+    attempted = 0
+    dropped = 0
     for timestamp in timestamps:
         orig_frame, orig_error = decode_frame(
             original.get("path"),
@@ -2455,89 +2837,67 @@ def compare_pair(original, other, config):
             if other_error:
                 errors.append(other_error)
             continue
-        orig_frames.append((timestamp, orig_frame))
-        other_frames.append((timestamp, other_frame))
-    if not orig_frames:
-        return None, None, None, errors or ["Could not decode a shared timestamp"]
-
-    orig_stats, _orig_crop = pair_picture_stats(orig_frames, config)
-    other_stats, _other_crop = pair_picture_stats(other_frames, config)
-    ssim_values = []
-    psnr_values = []
-    sheet_frames = []
-    for (timestamp, orig_frame), (_other_ts, other_frame) in zip(orig_frames, other_frames):
-        orig_gray = to_gray(display_bgr(orig_frame, parse_sar(original.get("sample_aspect_ratio")), safe_float(original.get("rotation"))))
-        other_gray = to_gray(display_bgr(other_frame, parse_sar(other.get("sample_aspect_ratio")), safe_float(other.get("rotation"))))
-        target_w = max(16, min(orig_gray.shape[1], other_gray.shape[1], config.analysis_frame_max_width))
-        target_h = max(16, min(orig_gray.shape[0], other_gray.shape[0]))
-        orig_fit = cv2.resize(orig_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        other_fit = cv2.resize(other_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        ssim = ssim_gray(orig_fit, other_fit)
-        psnr = psnr_gray(orig_fit, other_fit)
-        if ssim is not None:
-            ssim_values.append(ssim)
-        if psnr is not None:
-            psnr_values.append(psnr)
+        attempted += 1
+        orig_view = content_bgr(orig_frame, orig_crop, orig_sar, orig_rot)
+        other_view = content_bgr(other_frame, other_crop, other_sar, other_rot)
+        score = align_ssim(orig_view, other_view)
+        chosen = other_frame
+        if score is None or score < limits.pair_ssim_align:
+            start = max(0.0, float(timestamp) - 2.0 / fps)
+            window, window_error = decode_frames(
+                other.get("path"),
+                start,
+                other_meta["width"],
+                other_meta["height"],
+                config.frame_timeout,
+                1,
+                5,
+            )
+            if window_error and not window:
+                errors.append(window_error)
+            best_frame = None
+            best_score = -1.0
+            for candidate in window:
+                candidate_view = content_bgr(candidate, other_crop, other_sar, other_rot)
+                candidate_score = align_ssim(orig_view, candidate_view)
+                if candidate_score is not None and candidate_score > best_score:
+                    best_score = candidate_score
+                    best_frame = candidate
+            if best_frame is None or best_score < limits.pair_ssim_align:
+                dropped += 1
+                continue
+            chosen = best_frame
+        metrics = evaluate_pair_frames(
+            orig_frame,
+            chosen,
+            orig_crop,
+            other_crop,
+            orig_sar,
+            other_sar,
+            orig_rot,
+            other_rot,
+        )
+        if not metrics:
+            dropped += 1
+            continue
+        measured.append(metrics)
         if len(sheet_frames) < 4:
-            orig_bgr = cv2.cvtColor(orig_fit, cv2.COLOR_GRAY2BGR)
-            other_bgr = cv2.cvtColor(other_fit, cv2.COLOR_GRAY2BGR)
-            divider = np.full((target_h, 4, 3), 255, np.uint8)
-            sheet_frames.append((timestamp, np.hstack([orig_bgr, divider, other_bgr])))
-    summary = {
-        "orig": orig_stats,
-        "other": other_stats,
-        "ssim": float(np.mean(ssim_values)) if ssim_values else None,
-        "psnr": float(np.mean(psnr_values)) if psnr_values else None,
+            chosen_view = content_bgr(chosen, other_crop, other_sar, other_rot)
+            sheet_frames.append((timestamp, _sheet_pair(orig_view, chosen_view)))
+    if attempted == 0:
+        return None, sheet_frames, None, errors or ["Could not decode a shared timestamp"]
+    needed = min(limits.pair_min_frames, attempted)
+    fail_fraction = dropped / float(attempted)
+    summary = summarize_pair_metrics(measured, limits) if measured else {
+        "pair_misaligned": False,
+        "geometry_mismatch": False,
+        "range_shift": False,
     }
+    summary["aligned_frames"] = len(measured)
+    summary["dropped_frames"] = dropped
+    if len(measured) < needed or fail_fraction > limits.pair_align_fail_fraction:
+        summary["pair_misaligned"] = True
     return summary, sheet_frames, None, errors
-
-
-def pair_verdict(orig_stats, other_stats, halo_flag=8.0):
-    """Classify a processed file against its reference.
-
-    Positive blur delta means the other file is sharper. VMAF is not used:
-    fidelity to the original is a different question from whether the
-    picture got more watchable.
-    """
-    orig_blur = _metric(orig_stats, "median_blur", "avg_blur") or 0.0
-    other_blur = _metric(other_stats, "median_blur", "avg_blur") or 0.0
-    orig_noise = orig_stats.get("avg_noise") or 0.0
-    other_noise = other_stats.get("avg_noise") or 0.0
-    orig_block = orig_stats.get("avg_block") or 0.0
-    other_block = other_stats.get("avg_block") or 0.0
-    orig_halo = orig_stats.get("avg_halo") or 0.0
-    other_halo = other_stats.get("avg_halo") or 0.0
-    blur_delta = other_blur - orig_blur
-    noise_delta = other_noise - orig_noise
-    block_delta = other_block - orig_block
-    sharper = blur_delta > max(15.0, abs(orig_blur) * 0.12)
-    softer = blur_delta < -max(15.0, abs(orig_blur) * 0.12)
-    noisier = noise_delta > max(0.8, abs(orig_noise) * 0.25)
-    cleaner = noise_delta < -max(0.4, abs(orig_noise) * 0.15)
-    blockier = block_delta > 0.08
-    less_blocky = block_delta < -0.08
-    halo_worse = other_halo >= halo_flag and (other_halo - orig_halo) > 3.0
-    if sharper and halo_worse:
-        return "oversharpened"
-    bad = 0
-    good = 0
-    if softer:
-        bad += 2
-    if sharper:
-        good += 2
-    if noisier:
-        bad += 1
-    if cleaner:
-        good += 1
-    if blockier:
-        bad += 2
-    if less_blocky:
-        good += 1
-    if bad >= 2 and bad > good:
-        return "regressed"
-    if good >= 2 and good > bad:
-        return "improved"
-    return "similar"
 
 
 def _empty_group(**kwargs):
@@ -2559,6 +2919,10 @@ def _mark_paired(row):
         row["recommendation"] = "already_processed_review_only+" + recommendation
 
 
+def _field_interlaced(row):
+    return str(row.get("field_order") or "").lower() in INTERLACED_FIELD_ORDERS
+
+
 def compare_library(rows, config):
     """Write pair rows and mark processed siblings discovered by the match."""
     limits = config.thresholds or DEFAULT_THRESHOLDS
@@ -2575,11 +2939,16 @@ def compare_library(rows, config):
                 other_path=";".join(str(item.get("path") or "") for item in component),
                 other_filename=";".join(str(item.get("filename") or "") for item in component),
                 verdict="ambiguous_group",
+                action="manual_review",
                 note="More than one unmarked file shares this duration. Not compared.",
             ))
             continue
         folder = str(original.get("folder") or "")
         duration_delta = abs(safe_float(original.get("duration")) - safe_float(other.get("duration")))
+        mismatch = aspects_mismatch(original, other, limits.geometry_aspect_tolerance)
+        notes = [note] if note else []
+        if _field_interlaced(original) or _field_interlaced(other):
+            notes.append("interlaced")
         record = _empty_group(
             group_id=group_key(folder, original.get("duration")),
             folder=folder,
@@ -2589,11 +2958,26 @@ def compare_library(rows, config):
             other_filename=str(other.get("filename") or ""),
             duration_delta=round(duration_delta, 3),
             duration_mismatch=duration_delta > limits.pair_duration_seconds,
-            sar_mismatch=aspects_mismatch(original, other),
+            geometry_mismatch=mismatch,
             original_display=f"{original.get('display_width')}x{original.get('display_height')}",
             other_display=f"{other.get('display_width')}x{other.get('display_height')}",
-            note=note,
+            original_content=f"{original.get('content_width')}x{original.get('content_height')}",
+            other_content=f"{other.get('content_width')}x{other.get('content_height')}",
+            note="; ".join(notes),
         )
+        if mismatch:
+            left_aspect = row_content_aspect(original)
+            right_aspect = row_content_aspect(other)
+            if left_aspect and right_aspect:
+                notes.append(f"content aspect {left_aspect:.3f} vs {right_aspect:.3f}")
+            record["note"] = "; ".join(part for part in notes if part)
+            record["verdict"] = "geometry_mismatch"
+            record["action"] = pair_action("geometry_mismatch")
+            record["best_version"] = record["original_path"]
+            if note != "no_processed_marker":
+                _mark_paired(other)
+            group_rows.append(record)
+            continue
         try:
             summary, sheet_frames, _unused, errors = compare_pair(original, other, config)
         except Exception as exc:
@@ -2602,59 +2986,54 @@ def compare_library(rows, config):
             errors = [clip_error(exc)]
         if not summary:
             record["verdict"] = "compare_failed"
+            record["action"] = "manual_review"
+            record["best_version"] = record["original_path"]
             record["note"] = clip_error("; ".join(errors) if errors else "compare failed")
             group_rows.append(record)
             continue
-        orig_stats = summary["orig"]
-        other_stats = summary["other"]
         record.update({
-            "blur_delta": round_or_none(
-                (_metric(other_stats, "median_blur", "avg_blur") or 0)
-                - (_metric(orig_stats, "median_blur", "avg_blur") or 0),
-                3,
-            ),
-            "noise_delta": round_or_none(
-                (other_stats.get("avg_noise") or 0) - (orig_stats.get("avg_noise") or 0),
-                3,
-            ),
-            "blockiness_delta": round_or_none(
-                (other_stats.get("avg_block") or 0) - (orig_stats.get("avg_block") or 0),
-                3,
-            ),
-            "halo_delta": round_or_none(
-                (other_stats.get("avg_halo") or 0) - (orig_stats.get("avg_halo") or 0),
-                3,
-            ),
+            "blur_native": round_or_none(summary.get("blur_native"), 3),
+            "blur_vs_base": round_or_none(summary.get("blur_vs_base"), 3),
+            "block_native": round_or_none(summary.get("block_native"), 3),
+            "noise_native": round_or_none(summary.get("noise_native"), 3),
+            "halo_vs_base": round_or_none(summary.get("halo_vs_base"), 3),
             "ssim": round_or_none(summary.get("ssim"), 4),
-            "psnr": round_or_none(summary.get("psnr"), 3),
+            "luma_delta": round_or_none(summary.get("luma_delta"), 2),
+            "chroma_delta": round_or_none(summary.get("chroma_delta"), 2),
+            "range_shift": bool(summary.get("range_shift")),
+            "aligned_frames": summary.get("aligned_frames"),
+            "dropped_frames": summary.get("dropped_frames"),
         })
-        verdict = pair_verdict(orig_stats, other_stats, limits.halo_flag)
+        if summary.get("range_shift"):
+            luma = summary.get("luma_delta")
+            notes.append("range_shift" if luma is None else f"range_shift luma_delta={luma:.1f}")
+        chroma = summary.get("chroma_delta")
+        if chroma is not None and chroma >= limits.pair_chroma_shift:
+            notes.append(f"color_shift chroma_delta={chroma:.1f}")
+        record["note"] = "; ".join(part for part in notes if part)
+        verdict = pair_verdict(summary, limits)
         record["verdict"] = verdict
-        if verdict == "improved":
-            record["best_version"] = record["other_path"]
-        else:
-            record["best_version"] = record["original_path"]
+        record["action"] = pair_action(verdict)
+        record["best_version"] = (
+            record["other_path"] if verdict == "improved" else record["original_path"]
+        )
         if note != "no_processed_marker":
             _mark_paired(other)
-        if (
-            config.create_contact_sheets
-            and verdict in {"regressed", "oversharpened"}
-            and sheet_frames
-        ):
+        if config.create_contact_sheets and verdict != "improved" and sheet_frames:
             try:
                 create_contact_sheet(
                     other.get("path"),
                     sheet_frames,
                     {
                         "quality_issue_score": other.get("quality_issue_score"),
-                        "recommendation": verdict,
+                        "recommendation": record["action"],
                         "width": other.get("width"),
                         "height": other.get("height"),
                         "display_width": other.get("display_width"),
                         "display_height": other.get("display_height"),
-                        "avg_blur_score": record["blur_delta"],
-                        "avg_blockiness_score": record["blockiness_delta"],
-                        "avg_noise_score": record["noise_delta"],
+                        "avg_blur_score": record["blur_native"],
+                        "avg_blockiness_score": record["block_native"],
+                        "avg_noise_score": record["noise_native"],
                         "issue_flags": verdict,
                     },
                     config.contact_sheet_folder,
@@ -2836,7 +3215,7 @@ def print_summary(frame):
         "height",
         "display_width",
         "display_height",
-        "effective_height",
+        "fix_geometry",
         "avg_blur_score",
         "median_blur_score",
         "avg_blockiness_score",
@@ -2884,7 +3263,7 @@ def _natural_frame(height, width, seed):
 
 
 def calibration_checks():
-    """Direction checks for blur, noise, bandwidth, and blockiness.
+    """Direction checks for blur, noise, pairs, and blockiness.
 
     These are the in-memory half of a calibration set. They do not tune
     the numeric thresholds. They only fail when a metric moves backwards.
@@ -2896,23 +3275,13 @@ def calibration_checks():
 
     source = _natural_frame(360, 640, 3)
     blur_scores = []
-    bandwidths = []
     for sigma in (0, 1, 2, 4):
         image = source if sigma == 0 else cv2.GaussianBlur(source, (0, 0), sigma)
         blur_scores.append(blur_score_laplacian(image, 640))
-        bandwidths.append(effective_bandwidth(image))
     add(
         "blur decreases as gaussian blur increases",
         all(earlier > later for earlier, later in zip(blur_scores, blur_scores[1:])),
         " ".join(f"{score:.1f}" for score in blur_scores),
-    )
-    add(
-        "bandwidth decreases as gaussian blur increases",
-        all(
-            earlier is not None and later is not None and earlier > later
-            for earlier, later in zip(bandwidths, bandwidths[1:])
-        ),
-        " ".join("none" if value is None else f"{value:.2f}" for value in bandwidths),
     )
 
     rng = np.random.default_rng(5)
@@ -2931,20 +3300,26 @@ def calibration_checks():
         "sigma is float; the old median of an 8-bit residual stays at 0",
     )
 
-    native = _natural_frame(540, 960, 7)
-    small = cv2.resize(native, (320, 180), interpolation=cv2.INTER_AREA)
-    upscaled = cv2.resize(small, (960, 540), interpolation=cv2.INTER_CUBIC)
-    native_bw = effective_bandwidth(native)
-    up_bw = effective_bandwidth(upscaled)
+    native = _natural_frame(180, 320, 7)
+    cubic = cv2.resize(native, (640, 360), interpolation=cv2.INTER_CUBIC)
+    cubic_metrics = evaluate_pair_frames(native, cubic)
+    blurred = cv2.GaussianBlur(native, (0, 0), 2.0)
+    blurred_up = cv2.resize(blurred, (640, 360), interpolation=cv2.INTER_CUBIC)
+    blurred_metrics = evaluate_pair_frames(native, blurred_up)
     add(
-        "cubic upscale of a 3x downsample has less bandwidth",
-        native_bw is not None and up_bw is not None and up_bw < native_bw - 0.15,
-        f"native={native_bw} upscaled={up_bw}",
+        "bicubic upscale matches the bicubic baseline",
+        cubic_metrics is not None
+        and 0.9 <= cubic_metrics["blur_native"] <= 1.1
+        and 0.9 <= cubic_metrics["blur_vs_base"] <= 1.1,
+        str(cubic_metrics),
     )
     add(
-        "upscaled frame is softer at the analysis width",
-        blur_score_laplacian(upscaled, 640) < blur_score_laplacian(native, 640),
-        f"native={blur_score_laplacian(native, 640):.1f} upscaled={blur_score_laplacian(upscaled, 640):.1f}",
+        "a blurred upscale is softer than the bicubic roundtrip",
+        blurred_metrics is not None
+        and cubic_metrics is not None
+        and blurred_metrics["blur_native"] < cubic_metrics["blur_native"] - 0.2,
+        f"blurred={None if not blurred_metrics else round(blurred_metrics['blur_native'], 3)} "
+        f"cubic={None if not cubic_metrics else round(cubic_metrics['blur_native'], 3)}",
     )
 
     content = _natural_frame(360, 720, 9)
@@ -2973,6 +3348,14 @@ def calibration_checks():
         "block grid outscores a smooth ramp",
         blockiness_score(block) > blockiness_score(smooth),
         f"block={blockiness_score(block):.2f} smooth={blockiness_score(smooth):.2f}",
+    )
+    upscaled_blocks = cv2.resize(block, (192, 192), interpolation=cv2.INTER_NEAREST)
+    period_8 = blockiness_score(upscaled_blocks)
+    period_scaled = blockiness_scaled(upscaled_blocks, 1.5, 1.5)
+    add(
+        "scaled block period sees a 1.5x upscale the 8px period misses",
+        period_scaled > period_8 * 2,
+        f"period8={period_8:.2f} scaled={period_scaled:.2f}",
     )
     return checks
 
