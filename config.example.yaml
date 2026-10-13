@@ -1,0 +1,28 @@
+# Optional threshold overrides for scan_video_quality.py.
+# Run with: python scan_video_quality.py --config config.example.yaml --root ./videos
+# Omitted keys keep the built-in defaults. Uncomment a line to change it.
+
+# blur_very: 35
+# blur_blurry: 60
+# blur_soft: 100
+# blur_slightly_soft: 150
+# blur_sharp: 300
+# blur_grain_ratio: 2.0
+# block_slight: 1.30
+# block_blocky: 1.45
+# block_very: 1.60
+# median_noise_grainy: 4.0
+# hd_bpp_very_low: 0.04
+# hd_bpp_low: 0.07
+# sd_bpp_very_low: 0.05
+# sd_bpp_low: 0.09
+# dark_mean_brightness: 20
+# flat_std_max: 8
+# upscale_bandwidth_max: 0.66
+# bandwidth_drop_db: 22
+# combing_min: 0.12
+# halo_flag: 8
+# codec_efficiency:
+#   h264: 1.0
+#   hevc: 1.5
+#   av1: 1.8

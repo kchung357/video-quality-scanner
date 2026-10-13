@@ -1,9 +1,9 @@
 """Scan a video folder and write a CSV of heuristic quality issues.
 
-Frame samples are full-resolution raw frames. Blur is measured after scaling
-to the analysis width; blockiness and noise stay on the decoded pixels.
-Run ``python scan_video_quality.py --help`` for the command-line options.
-Defaults below are used when the matching flag is omitted.
+Frame samples are full-resolution raw frames. Blur is measured after a
+letterbox crop and a scale to the analysis width. Blockiness stays on the
+decoded pixel grid. Noise uses a float estimator. Run
+``python scan_video_quality.py --help`` for the command-line options.
 """
 
 import argparse
@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import cv2
@@ -30,27 +30,26 @@ from tqdm import tqdm
 # Configuration
 # ============================================================
 
+SCHEMA_VERSION = 2
+
 ROOT_FOLDER = r"./videos"
 OUTPUT_CSV = "video_quality_report.csv"
 
-# Contact sheets are optional JPEGs for manual review.
 CREATE_CONTACT_SHEETS = False
 CONTACT_SHEET_MIN_SCORE = 55
 CONTACT_SHEET_FOLDER = "contact_sheets"
 
-# Number of frames to sample per video.
+# Used only when --samples is passed. The default scan is adaptive.
 SAMPLE_COUNT = 8
+MIN_SAMPLE_COUNT = 16
+MAX_SAMPLE_COUNT = 40
+SAMPLE_EVERY_SECONDS = 300.0
 
-# Laplacian blur is resolution-dependent. Frames are scaled to this width
-# before the blur score so the thresholds below stay meaningful.
-# Blockiness and noise are measured at the decoded resolution.
 ANALYSIS_FRAME_MAX_WIDTH = 640
 CONTACT_THUMB_WIDTH = 320
+BANDWIDTH_MAX_SIDE = 960
 
-# Skip filenames that already look processed or upscaled.
 SKIP_ALREADY_PROCESSED = False
-
-# Parallel ffmpeg jobs. Each worker decodes its own video.
 DEFAULT_WORKERS = max(1, min(4, os.cpu_count() or 1))
 
 VIDEO_EXTENSIONS = {
@@ -72,87 +71,193 @@ PROCESSED_MARKERS = [
     "_deblur",
 ]
 
-# ------------------------------------------------------------
-# Thresholds. Classification, flags, score, and recommendations
-# all read these values.
-# Blur numbers apply to frames scaled to ANALYSIS_FRAME_MAX_WIDTH.
-# ------------------------------------------------------------
+ENCODER_MARKERS = ("topaz", "proteus", "artemis", "video2x", "realesrgan")
 
-BLUR_VERY = 35.0
-BLUR_BLURRY = 60.0
-BLUR_SOFT = 100.0
-BLUR_SLIGHTLY_SOFT = 150.0
-BLUR_SHARP = 300.0
+PAIR_MARKER_RE = re.compile(
+    r"(?:[_\-. ](?:prob|pnat|proteus|gaia|artemis|iris|topaz|upscale|enhanced|denoise|deblur)\d*)+$",
+    re.IGNORECASE,
+)
 
-# Laplacian at analysis width divided by Laplacian at half that width.
-# Real edges survive the extra downscale (ratio near 1). Grain and noise
-# do not (ratio near 4), so a high blur score is not real sharpness.
-BLUR_GRAIN_RATIO = 2.0
+INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 
-BLOCK_SLIGHT = 1.30
-BLOCK_BLOCKY = 1.45
-BLOCK_VERY = 1.60
+# Codec efficiency relative to H.264. The bitrate score uses
+# bits_per_pixel_frame * this factor. HEVC at the same bitrate is not
+# identical to H.264, but a 1.5x factor does not by itself clear a
+# 2 Mbps 1080p stream from the low-bitrate band.
+CODEC_EFFICIENCY = {
+    "mpeg1video": 0.55,
+    "mpeg2video": 0.6,
+    "mpeg4": 0.7,
+    "msmpeg4v2": 0.65,
+    "msmpeg4v3": 0.7,
+    "h263": 0.65,
+    "h264": 1.0,
+    "avc": 1.0,
+    "hevc": 1.5,
+    "h265": 1.5,
+    "vp8": 0.9,
+    "vp9": 1.4,
+    "av1": 1.8,
+}
 
-# Median of the median-filter residual, on the full decoded frame.
-# A high median means the grain is everywhere. Sparse edges leave the
-# median near zero, so subtitles and line art are not flagged as grain.
-MEDIAN_NOISE_GRAINY = 4.0
+CONTACT_REVIEW = {
+    "manual_review",
+    "check_source_upscaled_or_denoise",
+    "vr_equirect_review",
+}
 
-# Bits per pixel per frame. About the previous per-second thresholds
-# (HD 1.8, SD 2.5) divided by 30 fps, with a stricter "very low" band.
-HD_BPP_VERY_LOW = 0.04
-HD_BPP_LOW = 0.07
-SD_BPP_VERY_LOW = 0.05
-SD_BPP_LOW = 0.09
 
-DARK_PIXEL_THRESHOLD = 16
-DARK_FRAME_RATIO = 0.80
-DARK_MEAN_BRIGHTNESS = 12.0
-FLAT_STD_MAX = 4.0
+@dataclass
+class Thresholds:
+    """Tunable cutoffs. A config file overrides these defaults."""
 
-SCORE_CAP = 100.0
+    blur_very: float = 35.0
+    blur_blurry: float = 60.0
+    blur_soft: float = 100.0
+    blur_slightly_soft: float = 150.0
+    blur_sharp: float = 300.0
+    blur_grain_ratio: float = 2.0
+    block_slight: float = 1.30
+    block_blocky: float = 1.45
+    block_very: float = 1.60
+    median_noise_grainy: float = 4.0
+    hd_bpp_very_low: float = 0.04
+    hd_bpp_low: float = 0.07
+    sd_bpp_very_low: float = 0.05
+    sd_bpp_low: float = 0.09
+    dark_pixel_threshold: float = 16.0
+    dark_frame_ratio: float = 0.80
+    dark_mean_brightness: float = 20.0
+    flat_std_max: float = 8.0
+    score_cap: float = 100.0
+    upscale_bandwidth_max: float = 0.66
+    bandwidth_drop_db: float = 22.0
+    combing_min: float = 0.12
+    halo_flag: float = 8.0
+    vr_min_width: int = 3840
+    vr_aspect_tolerance: float = 0.02
+    unstable_blur_cv: float = 1.0
+    unstable_min_frames: int = 8
+    pair_duration_seconds: float = 1.0
+    codec_efficiency: dict = field(default_factory=lambda: dict(CODEC_EFFICIENCY))
+
+
+DEFAULT_THRESHOLDS = Thresholds()
+
+# Names kept for existing tests and for callers that read the defaults.
+BLUR_VERY = DEFAULT_THRESHOLDS.blur_very
+BLUR_BLURRY = DEFAULT_THRESHOLDS.blur_blurry
+BLUR_SOFT = DEFAULT_THRESHOLDS.blur_soft
+BLUR_SLIGHTLY_SOFT = DEFAULT_THRESHOLDS.blur_slightly_soft
+BLUR_SHARP = DEFAULT_THRESHOLDS.blur_sharp
+BLUR_GRAIN_RATIO = DEFAULT_THRESHOLDS.blur_grain_ratio
+BLOCK_SLIGHT = DEFAULT_THRESHOLDS.block_slight
+BLOCK_BLOCKY = DEFAULT_THRESHOLDS.block_blocky
+BLOCK_VERY = DEFAULT_THRESHOLDS.block_very
+MEDIAN_NOISE_GRAINY = DEFAULT_THRESHOLDS.median_noise_grainy
+HD_BPP_VERY_LOW = DEFAULT_THRESHOLDS.hd_bpp_very_low
+HD_BPP_LOW = DEFAULT_THRESHOLDS.hd_bpp_low
+SD_BPP_VERY_LOW = DEFAULT_THRESHOLDS.sd_bpp_very_low
+SD_BPP_LOW = DEFAULT_THRESHOLDS.sd_bpp_low
+DARK_PIXEL_THRESHOLD = DEFAULT_THRESHOLDS.dark_pixel_threshold
+DARK_FRAME_RATIO = DEFAULT_THRESHOLDS.dark_frame_ratio
+DARK_MEAN_BRIGHTNESS = DEFAULT_THRESHOLDS.dark_mean_brightness
+FLAT_STD_MAX = DEFAULT_THRESHOLDS.flat_std_max
+SCORE_CAP = DEFAULT_THRESHOLDS.score_cap
 
 CSV_COLUMNS = [
+    "schema_version",
     "path",
     "filename",
     "folder",
+    "mtime",
     "width",
     "height",
     "display_width",
     "display_height",
+    "content_width",
+    "content_height",
+    "crop",
     "sample_aspect_ratio",
     "rotation",
     "codec",
     "pix_fmt",
+    "encoder",
+    "color_range",
+    "color_space",
+    "field_order",
     "duration",
     "duration_hms",
     "frame_rate",
     "bit_rate",
     "size",
     "is_probably_processed",
+    "is_vr",
     "sampled_frames",
     "frames_used",
     "frames_excluded",
+    "sample_errors",
     "avg_blur_score",
+    "median_blur_score",
+    "blur_p10",
+    "blur_p90",
+    "blur_iqr",
+    "blur_cv",
     "min_blur_score",
     "max_blur_score",
     "blur_scale_ratio",
+    "blur_best_tiles",
     "avg_blockiness_score",
     "avg_noise_score",
     "median_noise_score",
+    "avg_halo_score",
+    "combing_score",
+    "effective_bandwidth",
+    "effective_height",
+    "upscale_suspected",
     "avg_brightness",
     "avg_black_frame_ratio",
     "bitrate_per_pixel",
     "bits_per_pixel_frame",
+    "bits_per_pixel_frame_eff",
+    "score_resolution",
+    "score_blur",
+    "score_blockiness",
+    "score_bitrate",
     "quality_issue_score",
     "resolution_class",
+    "effective_resolution_class",
     "blur_class",
     "blockiness_class",
     "issue_flags",
     "recommendation",
     "contact_sheet",
     "contact_sheet_error",
+    "sample_error",
     "error",
+]
+
+GROUP_COLUMNS = [
+    "group_id",
+    "folder",
+    "original_path",
+    "other_path",
+    "original_filename",
+    "other_filename",
+    "duration_delta",
+    "duration_mismatch",
+    "sar_mismatch",
+    "original_display",
+    "other_display",
+    "blur_delta",
+    "noise_delta",
+    "blockiness_delta",
+    "halo_delta",
+    "ssim",
+    "psnr",
+    "verdict",
+    "best_version",
+    "note",
 ]
 
 
@@ -164,6 +269,7 @@ class ScanConfig:
     contact_sheet_min_score: float = CONTACT_SHEET_MIN_SCORE
     contact_sheet_folder: str = CONTACT_SHEET_FOLDER
     sample_count: int = SAMPLE_COUNT
+    samples_explicit: bool = False
     analysis_frame_max_width: int = ANALYSIS_FRAME_MAX_WIDTH
     contact_thumb_width: int = CONTACT_THUMB_WIDTH
     skip_already_processed: bool = SKIP_ALREADY_PROCESSED
@@ -172,6 +278,13 @@ class ScanConfig:
     frame_timeout: float = 60.0
     probe_timeout: float = 30.0
     checkpoint_every: int = 5
+    pairs: bool = True
+    groups_csv: str = ""
+    thresholds: Thresholds = field(default_factory=Thresholds)
+
+
+def active_thresholds(thresholds=None):
+    return thresholds or DEFAULT_THRESHOLDS
 
 
 # ============================================================
@@ -223,9 +336,12 @@ def safe_float(value, default=0.0):
     try:
         if value is None or value == "":
             return default
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return default
+    if math.isnan(number) or math.isinf(number):
+        return default
+    return number
 
 
 def safe_int(value, default=0):
@@ -237,10 +353,26 @@ def safe_int(value, default=0):
         return default
 
 
+def as_bool(value):
+    if value is None:
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
 def round_or_none(value, digits):
     if value is None:
         return None
-    return round(float(value), digits)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return round(number, digits)
 
 
 def parse_fraction(frac_text):
@@ -291,6 +423,14 @@ def is_probably_processed(path):
     return any(marker in name for marker in PROCESSED_MARKERS)
 
 
+def looks_processed(path, encoder=""):
+    """Filename markers, or an encoder tag from a known restoration tool."""
+    if is_probably_processed(path):
+        return True
+    text = (encoder or "").lower()
+    return any(marker in text for marker in ENCODER_MARKERS)
+
+
 def format_duration(seconds):
     """Convert seconds to HH:MM:SS."""
     seconds = safe_float(seconds, 0)
@@ -338,6 +478,34 @@ def short_side(width, height, display_width=0, display_height=0):
     return 0
 
 
+def file_identity(path):
+    """Size and mtime, the resume identity together with the path."""
+    st = Path(path).stat()
+    return int(st.st_size), int(st.st_mtime)
+
+
+def path_seed(path):
+    digest = hashlib.sha1(str(path).encode("utf-8", "surrogateescape")).digest()
+    return int.from_bytes(digest[:4], "little")
+
+
+def codec_efficiency(codec, thresholds=None):
+    table = active_thresholds(thresholds).codec_efficiency or {}
+    if not codec:
+        return 1.0
+    try:
+        return float(table.get(str(codec).lower(), 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def recommendation_base(text):
+    raw = "" if text is None else str(text)
+    if "+" in raw:
+        return raw.split("+", 1)[1]
+    return raw
+
+
 def result_row(**kwargs):
     row = {column: None for column in CSV_COLUMNS}
     unknown = set(kwargs) - set(row)
@@ -350,17 +518,22 @@ def result_row(**kwargs):
 def base_row(video_path, meta=None, processed=False):
     path = Path(video_path)
     row = result_row(
+        schema_version=SCHEMA_VERSION,
         path=str(path),
         filename=path.name,
         folder=str(path.parent),
         is_probably_processed=bool(processed),
+        is_vr=False,
+        upscale_suspected=False,
         sampled_frames=0,
         frames_used=0,
         frames_excluded=0,
+        sample_errors=0,
         issue_flags="",
         recommendation="",
         contact_sheet="",
         contact_sheet_error="",
+        sample_error="",
         error="",
     )
     if meta:
@@ -373,14 +546,106 @@ def base_row(video_path, meta=None, processed=False):
             "rotation",
             "codec",
             "pix_fmt",
+            "encoder",
+            "color_range",
+            "color_space",
+            "field_order",
             "duration",
             "duration_hms",
             "frame_rate",
             "bit_rate",
             "size",
         ):
-            row[key] = meta.get(key)
+            if key in meta:
+                row[key] = meta.get(key)
     return row
+
+
+def coerce_scalar(value):
+    text = value.strip().strip("'\"")
+    lower = text.lower()
+    if lower in {"true", "yes"}:
+        return True
+    if lower in {"false", "no"}:
+        return False
+    try:
+        if any(token in lower for token in (".", "e")):
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
+def parse_simple_yaml(text):
+    """Parse the flat config file this scanner writes and reads.
+
+    Supports nested maps one level deep, comments, and scalars.
+    """
+    root = {}
+    stack = [(-1, root)]
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if ":" not in line:
+            raise ValueError(f"Invalid config line: {raw.strip()}")
+        key, _, value = line.strip().partition(":")
+        key = key.strip()
+        value = value.strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        if not stack:
+            raise ValueError(f"Invalid config indentation near {key}")
+        parent = stack[-1][1]
+        if not isinstance(parent, dict):
+            raise ValueError(f"Cannot nest under {key}")
+        if value == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = coerce_scalar(value)
+    return root
+
+
+def thresholds_from_mapping(mapping, base=None):
+    """Overlay a config mapping on the built-in thresholds."""
+    base = base or Thresholds()
+    if not mapping:
+        return base
+    unknown = sorted(key for key in mapping if key not in {item.name for item in fields(base)})
+    if unknown:
+        raise ValueError("Unknown config keys: " + ", ".join(unknown))
+    values = {}
+    for key, value in mapping.items():
+        default = getattr(base, key)
+        if key == "codec_efficiency":
+            if not isinstance(value, dict):
+                raise ValueError("codec_efficiency must be a map of codec names")
+            merged = dict(base.codec_efficiency)
+            for codec, factor in value.items():
+                merged[str(codec).lower()] = float(factor)
+            values[key] = merged
+        elif isinstance(default, float):
+            values[key] = float(value)
+        elif isinstance(default, bool):
+            values[key] = bool(value)
+        elif isinstance(default, int):
+            values[key] = int(value)
+        else:
+            values[key] = value
+    data = {item.name: getattr(base, item.name) for item in fields(base)}
+    data.update(values)
+    return Thresholds(**data)
+
+
+def load_thresholds(path):
+    path = Path(path)
+    text = path.read_text(encoding="utf-8")
+    return thresholds_from_mapping(parse_simple_yaml(text))
 
 
 # ============================================================
@@ -410,6 +675,8 @@ def ffprobe_video(path, timeout):
 
     stream = streams[0]
     fmt = data.get("format") or {}
+    tags = stream.get("tags") or {}
+    fmt_tags = fmt.get("tags") or {}
     width = safe_int(stream.get("width"))
     height = safe_int(stream.get("height"))
     raw_sar = stream.get("sample_aspect_ratio") or ""
@@ -449,6 +716,10 @@ def ffprobe_video(path, timeout):
         "rotation": rotation,
         "codec": stream.get("codec_name") or "",
         "pix_fmt": stream.get("pix_fmt") or "",
+        "encoder": tags.get("encoder") or fmt_tags.get("encoder") or "",
+        "color_range": stream.get("color_range") or "",
+        "color_space": stream.get("color_space") or "",
+        "field_order": stream.get("field_order") or "",
         "duration": duration,
         "duration_hms": format_duration(duration),
         "frame_rate": round(frame_rate, 3) if frame_rate > 0 else 0.0,
@@ -461,23 +732,41 @@ def ffprobe_video(path, timeout):
 # Frame extraction
 # ============================================================
 
-def sample_timestamps(duration, sample_count):
-    """Timestamps spread across the middle of the file."""
+def resolved_sample_count(duration, config):
+    """How many frames to take from one file.
+
+    ``--samples`` forces a count. Otherwise the scan takes at least 16
+    frames, one more for every five minutes, and never more than 40.
+    """
+    if config is not None and config.samples_explicit:
+        return max(1, int(config.sample_count))
+    adaptive = int(round(float(duration or 0) / SAMPLE_EVERY_SECONDS))
+    return min(MAX_SAMPLE_COUNT, max(MIN_SAMPLE_COUNT, adaptive))
+
+
+def sample_timestamps(duration, sample_count, seed=None):
+    """Timestamps spread across the file, skipping the head and tail.
+
+    ``seed`` adds a small repeatable jitter so two runs of the same file
+    land on the same frames without always hitting the same scene beat.
+    """
     if duration <= 0 or sample_count <= 0:
         return []
     last_ok = max(float(duration) - 0.04, 0.0)
     if int(sample_count) == 1:
         return [min(float(duration) * 0.5, last_ok)]
 
-    if duration < 60:
-        start_ratio, end_ratio = 0.05, 0.95
-    else:
-        start_ratio, end_ratio = 0.10, 0.90
-    start = float(duration) * start_ratio
-    end = float(duration) * end_ratio
+    edge = 0.05 if duration < 60 else 0.04
+    start = float(duration) * edge
+    end = float(duration) * (1.0 - edge)
     if end < start:
         end = start
     stamps = np.linspace(start, end, int(sample_count))
+    if seed is not None and len(stamps) > 1 and end > start:
+        gap = (end - start) / float(len(stamps))
+        jitter = gap * 0.12
+        rng = np.random.default_rng(int(seed) % (2**32))
+        stamps = np.asarray(stamps, dtype=np.float64) + rng.uniform(-jitter, jitter, size=len(stamps))
     return [float(min(max(float(stamp), 0.0), last_ok)) for stamp in stamps]
 
 
@@ -553,15 +842,16 @@ def decode_frame(video_path, timestamp, width, height, timeout, threads):
     return frame.copy(), ""
 
 
-def extract_sample_frames(video_path, meta, config):
-    """Decode sample frames. One bad timestamp does not drop the file.
-
-    A single select-filter pass would decode from the start of the file
-    through the last sample. Separate accurate seeks stay fast on long
-    videos and still land off the keyframe.
-    """
-    timestamps = sample_timestamps(meta["duration"], config.sample_count)
-    threads = 1 if config.workers > 1 else 0
+def extract_sample_frames(video_path, meta, config, sample_count=None, seed=None):
+    """Decode sample frames. One bad timestamp does not drop the file."""
+    count = sample_count
+    if count is None:
+        count = resolved_sample_count(meta["duration"], config)
+    if seed is None and config is not None:
+        seed = path_seed(video_path)
+    timestamps = sample_timestamps(meta["duration"], count, seed=seed)
+    threads = 1 if config is not None and config.workers > 1 else 0
+    timeout = 60.0 if config is None else config.frame_timeout
     frames = []
     errors = []
     for timestamp in timestamps:
@@ -570,7 +860,7 @@ def extract_sample_frames(video_path, meta, config):
             timestamp,
             meta["width"],
             meta["height"],
-            config.frame_timeout,
+            timeout,
             threads,
         )
         if frame is None:
@@ -626,6 +916,28 @@ def blur_score_laplacian(frame, max_width=ANALYSIS_FRAME_MAX_WIDTH):
     return blur
 
 
+def tile_sharpness(gray, tile=64):
+    """Mean Laplacian variance of the sharpest fifth of tiles.
+
+    This is recorded beside the full-frame score. It is not the number
+    the blur thresholds were tuned on.
+    """
+    gray = to_gray(gray)
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    height, width = lap.shape[:2]
+    if height < tile or width < tile:
+        return laplacian_var(gray)
+    values = []
+    for y in range(0, height - tile + 1, tile):
+        for x in range(0, width - tile + 1, tile):
+            values.append(float(lap[y:y + tile, x:x + tile].var()))
+    if not values:
+        return laplacian_var(gray)
+    values.sort()
+    keep = max(1, len(values) // 5)
+    return float(np.mean(values[-keep:]))
+
+
 def blockiness_score(frame):
     """Estimate 8x8 blocking on the frame as decoded, with no rescale.
 
@@ -659,16 +971,251 @@ def blockiness_score(frame):
 
 
 def noise_profile(frame):
-    """Return (mean residual, median residual) after a 3x3 median blur."""
+    """Mean absolute residual after a 3x3 median blur, on 8-bit pixels."""
     gray = to_gray(frame)
     residual = cv2.absdiff(gray, cv2.medianBlur(gray, 3))
-    return float(np.mean(residual)), float(np.median(residual))
+    return float(np.mean(residual))
+
+
+def noise_sigma(gray, std_max=12.0):
+    """Immerkaer noise sigma on locally flat pixels.
+
+    The residual is float, and edges are left out. A checkerboard has no
+    flat pixels, so it returns 0 instead of counting the pattern as grain.
+    """
+    g = np.asarray(to_gray(gray), np.float32)
+    if g.shape[0] < 8 or g.shape[1] < 8:
+        return 0.0
+    kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], np.float32)
+    response = np.abs(cv2.filter2D(g, cv2.CV_32F, kernel)[1:-1, 1:-1])
+    box = np.ones((5, 5), np.float32) / 25.0
+    mean = cv2.filter2D(g, cv2.CV_32F, box)[1:-1, 1:-1]
+    mean_sq = cv2.filter2D(g * g, cv2.CV_32F, box)[1:-1, 1:-1]
+    local = np.sqrt(np.maximum(mean_sq - mean * mean, 0))
+    flat = local <= float(std_max)
+    if int(flat.sum()) < 64:
+        return 0.0
+    return float(response[flat].mean() * np.sqrt(0.5 * np.pi) / 6.0)
 
 
 def noise_score(frame):
     """Mean high-frequency residual. Grain is not always a defect."""
-    mean_residual, _median_residual = noise_profile(frame)
-    return mean_residual
+    return noise_profile(frame)
+
+
+def halo_score(gray):
+    """Mean overshoot, in pixel levels, along strong edges.
+
+    A clean step edge scores near 0. Unsharp masking pushes this up.
+    """
+    g = np.asarray(to_gray(gray), np.float32)
+    if g.shape[0] < 8 or g.shape[1] < 8:
+        return 0.0
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy)
+    threshold = max(float(np.percentile(mag, 92)), 8.0)
+    ys, xs = np.nonzero(mag >= threshold)
+    if ys.size < 40:
+        return 0.0
+    if ys.size > 2500:
+        selected = np.linspace(0, ys.size - 1, 2500).astype(int)
+        ys = ys[selected]
+        xs = xs[selected]
+    inv = 1.0 / (mag[ys, xs] + 1e-6)
+    dx = gx[ys, xs] * inv
+    dy = gy[ys, xs] * inv
+    height, width = g.shape
+
+    def sample(shift):
+        yy = np.clip(np.rint(ys + dy * shift).astype(int), 0, height - 1)
+        xx = np.clip(np.rint(xs + dx * shift).astype(int), 0, width - 1)
+        return g[yy, xx]
+
+    dark_side = sample(-2)
+    before = sample(-1)
+    after = sample(1)
+    bright_side = sample(2)
+    undershoot = np.maximum(0, dark_side - before)
+    overshoot = np.maximum(0, after - bright_side)
+    return float(np.mean(undershoot + overshoot))
+
+
+def combing_score(gray):
+    """Fraction of pixels whose neighbour row disagrees more than the same field.
+
+    Progressive frames stay near 0. A woven pair of fields scores higher.
+    """
+    g = np.asarray(to_gray(gray), np.float32)
+    if g.shape[0] < 8:
+        return 0.0
+    current = g[2:, :]
+    adjacent = g[1:-1, :]
+    same_field = g[:-2, :]
+    inter = np.abs(current - adjacent)
+    intra = np.abs(current - same_field)
+    return float(np.mean(inter > (intra + 12.0)))
+
+
+def effective_bandwidth(gray, drop_db=22.0, max_side=BANDWIDTH_MAX_SIDE):
+    """Fraction of Nyquist that still carries detail.
+
+    The radial spectrum is compared with its own low-frequency level.
+    White noise and sharp frames stay near 1. A strong lowpass, including
+    a cubic upscale of a much smaller frame, falls earlier. The number is
+    an estimate: mild upscales and mild defocus can land in the same range.
+    """
+    g = np.asarray(to_gray(gray), np.float32)
+    height, width = g.shape[:2]
+    if height < 16 or width < 16:
+        return None
+    long_side = max(height, width)
+    if long_side > max_side:
+        scale = max_side / float(long_side)
+        g = cv2.resize(
+            g,
+            (max(2, int(round(width * scale))), max(2, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        height, width = g.shape[:2]
+    window = np.outer(np.hanning(height), np.hanning(width)).astype(np.float32)
+    centered = g - float(g.mean())
+    power = np.abs(np.fft.fftshift(np.fft.fft2(centered * window))) ** 2
+    cy = (height - 1) / 2.0
+    cx = (width - 1) / 2.0
+    yy, xx = np.indices(power.shape)
+    radius = np.hypot(yy - cy, xx - cx).astype(np.int32)
+    limit = min(height, width) // 2
+    if limit < 16:
+        return None
+    counts = np.bincount(radius.ravel())[:limit]
+    sums = np.bincount(radius.ravel(), weights=power.ravel())[:limit]
+    mean = sums / np.maximum(counts, 1)
+    bins = 32
+    edges = np.linspace(0, len(mean), bins + 1).astype(int)
+    levels = []
+    for start, stop in zip(edges[:-1], edges[1:]):
+        chunk = mean[max(int(start), 1):max(int(stop), int(start) + 1)]
+        levels.append(float(np.median(chunk)) if chunk.size else 0.0)
+    levels = np.asarray(levels, dtype=np.float64) + 1e-12
+    reference = float(np.median(levels[2:6]))
+    if reference <= 0:
+        return None
+    decibels = 10.0 * np.log10(levels / reference)
+    if float(np.median(decibels[int(bins * 0.75):])) >= -float(drop_db):
+        return 1.0
+    above = np.flatnonzero(decibels >= -float(drop_db))
+    if above.size == 0:
+        return 0.0
+    return float((int(above.max()) + 0.5) / bins)
+
+
+def letterbox_bounds(frame, thresh=16):
+    """Crop rectangle (x, y, w, h) for black bars on the outer edges."""
+    gray = to_gray(frame)
+    height, width = gray.shape[:2]
+    if height < 32 or width < 32:
+        return (0, 0, width, height)
+    row_mean = gray.mean(axis=1)
+    col_mean = gray.mean(axis=0)
+    top = 0
+    while top < height - 1 and row_mean[top] <= thresh:
+        top += 1
+    bottom = height
+    while bottom > top + 1 and row_mean[bottom - 1] <= thresh:
+        bottom -= 1
+    left = 0
+    while left < width - 1 and col_mean[left] <= thresh:
+        left += 1
+    right = width
+    while right > left + 1 and col_mean[right - 1] <= thresh:
+        right -= 1
+    if top < 4:
+        top = 0
+    if height - bottom < 4:
+        bottom = height
+    if left < 4:
+        left = 0
+    if width - right < 4:
+        right = width
+    crop_h = bottom - top
+    crop_w = right - left
+    if crop_h < height * 0.5 or crop_w < width * 0.5 or crop_h < 16 or crop_w < 16:
+        return (0, 0, width, height)
+    return (left, top, crop_w, crop_h)
+
+
+def consensus_letterbox(frames, thresh=16):
+    """One crop for the file, from the frames that actually show bars."""
+    if not frames:
+        return (0, 0, 0, 0)
+    boxes = [letterbox_bounds(frame, thresh) for frame in frames]
+    gray = to_gray(frames[0])
+    height, width = gray.shape[:2]
+    real = [
+        box for box in boxes
+        if not (box[0] == 0 and box[1] == 0 and box[2] == width and box[3] == height)
+    ]
+    chosen = real or boxes
+    left = int(np.median([box[0] for box in chosen]))
+    top = int(np.median([box[1] for box in chosen]))
+    right = int(np.median([box[0] + box[2] for box in chosen]))
+    bottom = int(np.median([box[1] + box[3] for box in chosen]))
+    left = max(0, min(left, width - 16))
+    top = max(0, min(top, height - 16))
+    right = max(left + 16, min(right, width))
+    bottom = max(top + 16, min(bottom, height))
+    if (bottom - top) < height * 0.5 or (right - left) < width * 0.5:
+        return (0, 0, width, height)
+    return (left, top, right - left, bottom - top)
+
+
+def center_window(width, height, fraction=0.5):
+    """8-pixel-aligned window in the middle of the frame."""
+    crop_w = max(16, int(width * fraction))
+    crop_h = max(16, int(height * fraction))
+    crop_w -= crop_w % 8
+    crop_h -= crop_h % 8
+    crop_w = max(16, min(crop_w, width - (width % 8 if width >= 16 else 0)))
+    crop_h = max(16, min(crop_h, height))
+    x = max(0, ((width - crop_w) // 2) // 8 * 8)
+    y = max(0, ((height - crop_h) // 2) // 8 * 8)
+    if x + crop_w > width:
+        crop_w = width - x
+    if y + crop_h > height:
+        crop_h = height - y
+    return (int(x), int(y), int(crop_w), int(crop_h))
+
+
+def apply_crop(gray, crop):
+    if crop is None:
+        return gray
+    x, y, width, height = [int(value) for value in crop]
+    x = max(0, x)
+    y = max(0, y)
+    if width <= 1 or height <= 1:
+        return gray
+    view = gray[y:y + height, x:x + width]
+    if view.size == 0:
+        return gray
+    return view
+
+
+def is_vr_equirect(width, height, thresholds=None):
+    limits = active_thresholds(thresholds)
+    if width < limits.vr_min_width or height <= 0:
+        return False
+    ratio = float(width) / float(height)
+    return abs(ratio - 2.0) <= limits.vr_aspect_tolerance
+
+
+def frame_fingerprint(gray):
+    small = cv2.resize(to_gray(gray), (32, 32), interpolation=cv2.INTER_AREA)
+    return small.astype(np.float32)
+
+
+def fingerprints_match(first, second, max_mad=1.5):
+    return float(np.mean(np.abs(first - second))) <= max_mad
 
 
 def black_frame_ratio(frame, threshold=DARK_PIXEL_THRESHOLD):
@@ -681,63 +1228,166 @@ def brightness_score(frame):
     return float(np.mean(gray))
 
 
-def measure_frame(frame, max_width=ANALYSIS_FRAME_MAX_WIDTH):
-    """Metrics for one decoded frame. Blur is scaled; blockiness is not."""
-    gray = to_gray(frame)
-    brightness = float(np.mean(gray))
-    black = float(np.mean(gray < DARK_PIXEL_THRESHOLD))
-    std = float(np.std(gray))
-    exclude = (
-        black >= DARK_FRAME_RATIO
-        or brightness <= DARK_MEAN_BRIGHTNESS
-        or std < FLAT_STD_MAX
+def measure_frame(frame, max_width=ANALYSIS_FRAME_MAX_WIDTH, crop=None, block_crop=None, thresholds=None):
+    """Metrics for one decoded frame.
+
+    Blur, noise, halo, and bandwidth use the active picture. Blockiness
+    stays on the coded grid unless ``block_crop`` is set (VR center).
+    """
+    limits = active_thresholds(thresholds)
+    gray_full = to_gray(frame)
+    content = apply_crop(gray_full, crop)
+    block_source = apply_crop(gray_full, block_crop) if block_crop is not None else gray_full
+    brightness = float(np.mean(content))
+    black = float(np.mean(content < limits.dark_pixel_threshold))
+    std = float(np.std(content))
+    exclude_dark = (
+        black >= limits.dark_frame_ratio
+        or brightness <= limits.dark_mean_brightness
+        or std < limits.flat_std_max
     )
-    blur, ratio = blur_profile(gray, max_width)
-    mean_noise, median_noise = noise_profile(gray)
+    blur, ratio = blur_profile(content, max_width)
+    scaled = scale_gray(content, max_width)
+    bandwidth = effective_bandwidth(content, drop_db=limits.bandwidth_drop_db)
     return {
         "blur": blur,
         "blur_scale_ratio": ratio,
-        "block": blockiness_score(gray),
-        "noise": mean_noise,
-        "median_noise": median_noise,
+        "blur_best_tiles": tile_sharpness(scaled),
+        "block": blockiness_score(block_source),
+        "noise": noise_profile(content),
+        "noise_sigma": noise_sigma(content),
+        "halo": halo_score(content),
+        "combing": combing_score(gray_full),
+        "bandwidth": bandwidth,
         "brightness": brightness,
         "black": black,
         "std": std,
-        "exclude": exclude,
+        "exclude_dark": exclude_dark,
+        "exclude_duplicate": False,
+        "exclude": exclude_dark,
     }
 
 
-def aggregate_metrics(measured):
-    """Average blur, blockiness, and noise over frames that are not dark or flat.
+def mark_duplicate_frames(measured, frames, crop=None):
+    """Drop a sample that repeats the previous kept frame."""
+    previous = None
+    for item, (_timestamp, frame) in zip(measured, frames):
+        if item.get("exclude_dark"):
+            continue
+        fingerprint = frame_fingerprint(apply_crop(to_gray(frame), crop))
+        if previous is not None and fingerprints_match(previous, fingerprint):
+            item["exclude_duplicate"] = True
+            item["exclude"] = True
+        else:
+            previous = fingerprint
+    return measured
 
-    Brightness and the black-pixel ratio always use every sample. If every
-    sample is dark or flat, those samples are used anyway and mostly_dark
-    is set so the score does not treat a black frame as blur.
+
+def _values(items, key):
+    found = []
+    for item in items:
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(number):
+            continue
+        found.append(number)
+    return found
+
+
+def aggregate_metrics(measured, content_short_side=None):
+    """Robust blur stats, plus mean blockiness and a median noise sigma.
+
+    Near-black, flat, and duplicate samples are left out of the picture
+    metrics. If every sample is dark or flat, those samples are used
+    anyway and mostly_dark is set so the score does not treat black as blur.
     """
-    usable = [item for item in measured if not item["exclude"]]
-    mostly_dark = not usable
-    chosen = measured if mostly_dark else usable
+    if not measured:
+        raise ValueError("No measurements to aggregate")
+    for item in measured:
+        if "exclude_dark" not in item:
+            item["exclude_dark"] = bool(item.get("exclude"))
+        item.setdefault("exclude_duplicate", False)
 
-    def mean(key):
-        return float(np.mean([item[key] for item in chosen]))
-
-    ratios = [
-        item["blur_scale_ratio"]
-        for item in chosen
-        if item["blur_scale_ratio"] is not None
+    usable = [
+        item for item in measured
+        if not item.get("exclude_dark") and not item.get("exclude_duplicate")
     ]
+    nondark = [item for item in measured if not item.get("exclude_dark")]
+    if usable:
+        chosen = usable
+        mostly_dark = False
+    elif nondark:
+        chosen = nondark
+        mostly_dark = False
+    else:
+        chosen = measured
+        mostly_dark = True
+
+    blur_vals = _values(chosen, "blur")
+    blur_arr = np.asarray(blur_vals, dtype=np.float64) if blur_vals else np.asarray([], dtype=np.float64)
+
+    def pct(percent):
+        if blur_arr.size == 0:
+            return None
+        return float(np.percentile(blur_arr, percent))
+
+    median_blur = float(np.median(blur_arr)) if blur_arr.size else None
+    p10 = pct(10)
+    p90 = pct(90)
+    iqr = None
+    if blur_arr.size:
+        iqr = float(np.percentile(blur_arr, 75) - np.percentile(blur_arr, 25))
+    blur_cv = None
+    if median_blur is not None and iqr is not None and abs(median_blur) > 1e-6:
+        blur_cv = float(iqr / median_blur)
+
+    ratios = _values(chosen, "blur_scale_ratio")
+    sigmas = _values(chosen, "noise_sigma")
+    # A black or flat sample has no spectrum worth reading.
+    bandwidths = [] if mostly_dark else _values(chosen, "bandwidth")
+    halos = _values(chosen, "halo")
+    combing = _values(chosen, "combing")
+    tiles = _values(chosen, "blur_best_tiles")
+    blocks = _values(chosen, "block")
+    noises = _values(chosen, "noise")
+
+    bandwidth = float(np.median(bandwidths)) if bandwidths else None
+    effective_height = None
+    if bandwidth is not None and content_short_side:
+        effective_height = float(bandwidth) * float(content_short_side)
+
+    dark_count = sum(1 for item in measured if item.get("exclude_dark"))
+    duplicate_count = sum(
+        1 for item in measured
+        if item.get("exclude_duplicate") and not item.get("exclude_dark")
+    )
     return {
-        "avg_blur": mean("blur"),
-        "min_blur": float(np.min([item["blur"] for item in chosen])),
-        "max_blur": float(np.max([item["blur"] for item in chosen])),
-        "avg_block": mean("block"),
-        "avg_noise": mean("noise"),
-        "median_noise": mean("median_noise"),
+        "avg_blur": float(np.mean(blur_arr)) if blur_arr.size else None,
+        "median_blur": median_blur,
+        "blur_p10": p10,
+        "blur_p90": p90,
+        "blur_iqr": iqr,
+        "blur_cv": blur_cv,
+        "min_blur": float(np.min(blur_arr)) if blur_arr.size else None,
+        "max_blur": float(np.max(blur_arr)) if blur_arr.size else None,
+        "avg_block": float(np.mean(blocks)) if blocks else None,
+        "avg_noise": float(np.mean(noises)) if noises else None,
+        "median_noise": float(np.median(sigmas)) if sigmas else None,
+        "avg_halo": float(np.mean(halos)) if halos else None,
+        "combing": float(np.median(combing)) if combing else None,
+        "blur_best_tiles": float(np.median(tiles)) if tiles else None,
         "blur_scale_ratio": float(np.mean(ratios)) if ratios else None,
-        "avg_brightness": float(np.mean([item["brightness"] for item in measured])),
-        "avg_black": float(np.mean([item["black"] for item in measured])),
+        "bandwidth": bandwidth,
+        "effective_height": effective_height,
+        "avg_brightness": float(np.mean(_values(measured, "brightness"))),
+        "avg_black": float(np.mean(_values(measured, "black"))),
         "frames_used": len(chosen),
-        "frames_excluded": len(measured) - len(usable),
+        "frames_excluded": dark_count + duplicate_count,
         "mostly_dark": mostly_dark,
     }
 
@@ -757,11 +1407,40 @@ def bits_per_pixel_per_frame(bit_rate, width, height, frame_rate):
     return float(bit_rate) / (pixels * float(frame_rate))
 
 
+def ssim_gray(first, second):
+    """Mean SSIM of two grayscale images with the same shape."""
+    if first.shape != second.shape or min(first.shape) < 16:
+        return None
+    first_f = first.astype(np.float64)
+    second_f = second.astype(np.float64)
+    c1 = (0.01 * 255) ** 2
+    c2 = (0.03 * 255) ** 2
+    mu_a = cv2.GaussianBlur(first_f, (11, 11), 1.5)
+    mu_b = cv2.GaussianBlur(second_f, (11, 11), 1.5)
+    sigma_a = cv2.GaussianBlur(first_f * first_f, (11, 11), 1.5) - mu_a ** 2
+    sigma_b = cv2.GaussianBlur(second_f * second_f, (11, 11), 1.5) - mu_b ** 2
+    sigma_ab = cv2.GaussianBlur(first_f * second_f, (11, 11), 1.5) - mu_a * mu_b
+    numerator = (2 * mu_a * mu_b + c1) * (2 * sigma_ab + c2)
+    denominator = (mu_a ** 2 + mu_b ** 2 + c1) * (sigma_a + sigma_b + c2)
+    return float(np.mean(numerator / denominator))
+
+
+def psnr_gray(first, second):
+    if first.shape != second.shape:
+        return None
+    mse = float(np.mean((first.astype(np.float64) - second.astype(np.float64)) ** 2))
+    if mse <= 1e-12:
+        return 100.0
+    return float(10.0 * math.log10((255.0 ** 2) / mse))
+
+
 # ============================================================
 # Scoring and classification
 # ============================================================
 
-def classify_resolution(side):
+def classify_resolution(side, vr=False):
+    if vr:
+        return "vr_equirect"
     if side <= 0:
         return "unknown_resolution"
     if side <= 270:
@@ -779,51 +1458,58 @@ def classify_resolution(side):
     return "above_1080"
 
 
-def is_grain_dominated(avg_blur, blur_scale_ratio):
+def is_grain_dominated(avg_blur, blur_scale_ratio, thresholds=None):
+    limits = active_thresholds(thresholds)
     if avg_blur is None or blur_scale_ratio is None:
         return False
-    return avg_blur >= BLUR_SLIGHTLY_SOFT and blur_scale_ratio >= BLUR_GRAIN_RATIO
+    return avg_blur >= limits.blur_slightly_soft and blur_scale_ratio >= limits.blur_grain_ratio
 
 
-def is_high_grain(median_noise):
-    return median_noise is not None and float(median_noise) >= MEDIAN_NOISE_GRAINY
+def is_high_grain(median_noise, thresholds=None):
+    limits = active_thresholds(thresholds)
+    return median_noise is not None and float(median_noise) >= limits.median_noise_grainy
 
 
-def is_sharpish(avg_blur, blur_scale_ratio, median_noise):
+def is_sharpish(avg_blur, blur_scale_ratio, median_noise, thresholds=None):
     """True when the blur score is real detail, not grain."""
-    if avg_blur is None or avg_blur < BLUR_SLIGHTLY_SOFT:
+    limits = active_thresholds(thresholds)
+    if avg_blur is None or avg_blur < limits.blur_slightly_soft:
         return False
-    if is_grain_dominated(avg_blur, blur_scale_ratio):
+    if is_grain_dominated(avg_blur, blur_scale_ratio, limits):
         return False
-    if is_high_grain(median_noise):
+    if is_high_grain(median_noise, limits):
         return False
     return True
 
 
-def classify_blur(avg_blur, blur_scale_ratio=None):
+def classify_blur(avg_blur, blur_scale_ratio=None, thresholds=None):
+    limits = active_thresholds(thresholds)
     if avg_blur is None:
         return "unknown_blur"
-    if avg_blur < BLUR_VERY:
+    if avg_blur < limits.blur_very:
         return "very_blurry"
-    if avg_blur < BLUR_BLURRY:
+    if avg_blur < limits.blur_blurry:
         return "blurry"
-    if avg_blur < BLUR_SOFT:
+    if avg_blur < limits.blur_soft:
         return "soft"
-    if avg_blur < BLUR_SLIGHTLY_SOFT:
+    if avg_blur < limits.blur_slightly_soft:
         return "slightly_soft"
-    if is_grain_dominated(avg_blur, blur_scale_ratio) or avg_blur >= BLUR_SHARP:
-        return "sharp_or_noisy"
+    if is_grain_dominated(avg_blur, blur_scale_ratio, limits):
+        return "grain_dominated"
+    if avg_blur >= limits.blur_sharp:
+        return "sharp"
     return "acceptable_sharpness"
 
 
-def classify_blockiness(avg_block):
+def classify_blockiness(avg_block, thresholds=None):
+    limits = active_thresholds(thresholds)
     if avg_block is None:
         return "unknown_blockiness"
-    if avg_block > BLOCK_VERY:
+    if avg_block > limits.block_very:
         return "very_blocky"
-    if avg_block > BLOCK_BLOCKY:
+    if avg_block > limits.block_blocky:
         return "blocky"
-    if avg_block > BLOCK_SLIGHT:
+    if avg_block > limits.block_slight:
         return "slightly_blocky"
     return "not_obviously_blocky"
 
@@ -844,62 +1530,100 @@ def resolution_points(side):
     return 0
 
 
-def blur_points(avg_blur):
+def blur_points(avg_blur, thresholds=None):
+    limits = active_thresholds(thresholds)
     if avg_blur is None:
         return 0
-    if avg_blur < BLUR_VERY:
+    if avg_blur < limits.blur_very:
         return 45
-    if avg_blur < BLUR_BLURRY:
+    if avg_blur < limits.blur_blurry:
         return 32
-    if avg_blur < BLUR_SOFT:
+    if avg_blur < limits.blur_soft:
         return 18
-    if avg_blur < BLUR_SLIGHTLY_SOFT:
+    if avg_blur < limits.blur_slightly_soft:
         return 8
     return 0
 
 
-def block_points(avg_block):
+def block_points(avg_block, thresholds=None):
+    limits = active_thresholds(thresholds)
     if avg_block is None:
         return 0
-    if avg_block > BLOCK_VERY:
+    if avg_block > limits.block_very:
         return 35
-    if avg_block > BLOCK_BLOCKY:
+    if avg_block > limits.block_blocky:
         return 22
-    if avg_block > BLOCK_SLIGHT:
+    if avg_block > limits.block_slight:
         return 10
     return 0
 
 
-def bitrate_points(side, bits_per_pixel_frame):
-    if not bits_per_pixel_frame or bits_per_pixel_frame <= 0 or side <= 0:
+def bitrate_points(side, bits_per_pixel_frame, codec=None, vr=False, thresholds=None):
+    limits = active_thresholds(thresholds)
+    if vr or not bits_per_pixel_frame or bits_per_pixel_frame <= 0 or side <= 0:
         return 0
+    adjusted = float(bits_per_pixel_frame) * codec_efficiency(codec, limits)
     if side >= 720:
-        if bits_per_pixel_frame < HD_BPP_VERY_LOW:
+        if adjusted < limits.hd_bpp_very_low:
             return 15
-        if bits_per_pixel_frame < HD_BPP_LOW:
+        if adjusted < limits.hd_bpp_low:
             return 8
         return 0
     if side <= 480:
-        if bits_per_pixel_frame < SD_BPP_VERY_LOW:
+        if adjusted < limits.sd_bpp_very_low:
             return 15
-        if bits_per_pixel_frame < SD_BPP_LOW:
+        if adjusted < limits.sd_bpp_low:
             return 8
     return 0
 
 
-def calculate_issue_score(side, avg_blur, avg_block, bits_per_pixel_frame):
-    """0-100 issue score. Higher means a stronger restoration candidate.
+def issue_score_parts(side, avg_blur, avg_block, bits_per_pixel_frame, codec=None, vr=False, thresholds=None):
+    """The four pieces of the issue score, before the cap."""
+    return {
+        "score_resolution": resolution_points(side),
+        "score_blur": blur_points(avg_blur, thresholds),
+        "score_blockiness": block_points(avg_block, thresholds),
+        "score_bitrate": bitrate_points(
+            side,
+            bits_per_pixel_frame,
+            codec=codec,
+            vr=vr,
+            thresholds=thresholds,
+        ),
+    }
 
-    Each part has its own ceiling, so a ruined 1080p file can reach the
-    high band without help from a low-resolution bonus. The total is capped.
-    """
-    total = (
-        resolution_points(side)
-        + blur_points(avg_blur)
-        + block_points(avg_block)
-        + bitrate_points(side, bits_per_pixel_frame)
-    )
-    return round(min(SCORE_CAP, float(total)), 2)
+
+def calculate_issue_score(
+    side,
+    avg_blur,
+    avg_block,
+    bits_per_pixel_frame,
+    codec=None,
+    vr=False,
+    thresholds=None,
+):
+    """0-100 issue score. Higher means a stronger restoration candidate."""
+    limits = active_thresholds(thresholds)
+    total = sum(issue_score_parts(
+        side,
+        avg_blur,
+        avg_block,
+        bits_per_pixel_frame,
+        codec=codec,
+        vr=vr,
+        thresholds=limits,
+    ).values())
+    return round(min(limits.score_cap, float(total)), 2)
+
+
+def upscale_suspected(short_side_px, avg_blur, bandwidth, thresholds=None):
+    """HD container whose spectrum and sharpness both look like a smaller source."""
+    limits = active_thresholds(thresholds)
+    if short_side_px < 720 or bandwidth is None or avg_blur is None:
+        return False
+    if float(avg_blur) >= limits.blur_slightly_soft:
+        return False
+    return float(bandwidth) <= limits.upscale_bandwidth_max
 
 
 def build_issue_flags(
@@ -911,33 +1635,63 @@ def build_issue_flags(
     median_noise=None,
     mostly_dark=False,
     blur_scale_ratio=None,
+    codec=None,
+    vr=False,
+    upscale=False,
+    combed=False,
+    halo=None,
+    unstable=False,
+    bitrate_side=None,
+    thresholds=None,
 ):
+    limits = active_thresholds(thresholds)
     flags = []
     if processed:
         flags.append("already_processed_name")
+    if vr:
+        flags.append("vr_equirect")
+    if upscale:
+        flags.append("upscale_suspected")
 
-    resolution_class = classify_resolution(short_side_px)
+    resolution_class = classify_resolution(short_side_px, vr=vr)
     if resolution_class in {"very_tiny", "very_low_resolution", "low_resolution", "sd_plus"}:
         flags.append(resolution_class)
 
     if mostly_dark:
         flags.append("mostly_dark_or_flat")
     else:
-        blur_class = classify_blur(avg_blur, blur_scale_ratio)
-        block_class = classify_blockiness(avg_block)
+        blur_class = classify_blur(avg_blur, blur_scale_ratio, limits)
+        block_class = classify_blockiness(avg_block, limits)
         if blur_class in {"very_blurry", "blurry", "soft", "slightly_soft"}:
             flags.append(blur_class)
-        if is_grain_dominated(avg_blur, blur_scale_ratio):
+        if is_grain_dominated(avg_blur, blur_scale_ratio, limits):
             flags.append("grain_dominated_sharpness")
-        if is_high_grain(median_noise):
+        if is_high_grain(median_noise, limits):
             flags.append("high_grain")
         if block_class in {"very_blocky", "blocky", "slightly_blocky"}:
             flags.append(block_class)
+        if (
+            halo is not None
+            and avg_blur is not None
+            and float(halo) >= limits.halo_flag
+            and float(avg_blur) >= limits.blur_sharp
+            and not is_high_grain(median_noise, limits)
+        ):
+            flags.append("possible_oversharpen")
 
+    if combed:
+        flags.append("interlaced_or_combed")
+    if unstable:
+        flags.append("unstable_blur")
+
+    adjusted = None
     if bits_per_pixel_frame and bits_per_pixel_frame > 0:
-        if short_side_px >= 720 and bits_per_pixel_frame < HD_BPP_LOW:
+        adjusted = float(bits_per_pixel_frame) * codec_efficiency(codec, limits)
+    rate_side = short_side_px if bitrate_side is None else bitrate_side
+    if adjusted and not vr:
+        if rate_side >= 720 and adjusted < limits.hd_bpp_low:
             flags.append("low_bitrate_for_hd")
-        elif 0 < short_side_px <= 480 and bits_per_pixel_frame < SD_BPP_LOW:
+        elif 0 < rate_side <= 480 and adjusted < limits.sd_bpp_low:
             flags.append("low_bitrate_for_sd")
 
     if not flags:
@@ -954,25 +1708,35 @@ def assign_recommendation(
     median_noise=None,
     blur_scale_ratio=None,
     mostly_dark=False,
+    upscale=False,
+    effective_side=None,
+    combed=False,
+    vr=False,
+    unstable=False,
+    thresholds=None,
 ):
     """Pick a review label from the same thresholds as the score.
 
-    Specific restoration labels win over the generic high-score label.
-    A sharp low-resolution file is an upscale candidate even when the
-    score is low. Grain is not treated as detail worth upscaling.
+    An upscale suspicion judges the low-resolution branches with the
+    effective short side. A blurry HD file that is not an upscale gets
+    its own label instead of ``low_priority_or_ok``.
     """
-    low_res = 0 < side <= 576
-    very_low_res = 0 < side <= 360
-    blurry = avg_blur is not None and avg_blur < BLUR_SOFT
-    very_blurry = avg_blur is not None and avg_blur < BLUR_BLURRY
+    limits = active_thresholds(thresholds)
+    judge_side = side
+    if upscale and effective_side and 0 < float(effective_side) < float(side or 0):
+        judge_side = float(effective_side)
+    low_res = 0 < judge_side <= 576
+    very_low_res = 0 < judge_side <= 360
+    blurry = avg_blur is not None and avg_blur < limits.blur_soft
+    very_blurry = avg_blur is not None and avg_blur < limits.blur_blurry
     slightly_soft = (
         avg_blur is not None
-        and BLUR_SOFT <= avg_blur < BLUR_SLIGHTLY_SOFT
+        and limits.blur_soft <= avg_blur < limits.blur_slightly_soft
     )
-    blocky = avg_block is not None and avg_block > BLOCK_BLOCKY
-    sharpish = is_sharpish(avg_blur, blur_scale_ratio, median_noise)
-    grain_dominated = is_grain_dominated(avg_blur, blur_scale_ratio)
-    high_grain = is_high_grain(median_noise)
+    blocky = avg_block is not None and avg_block > limits.block_blocky
+    sharpish = is_sharpish(avg_blur, blur_scale_ratio, median_noise, limits)
+    grain_dominated = is_grain_dominated(avg_blur, blur_scale_ratio, limits)
+    high_grain = is_high_grain(median_noise, limits)
 
     if mostly_dark:
         base = "manual_review"
@@ -990,11 +1754,19 @@ def assign_recommendation(
         base = "artifact_reduction_review"
     elif grain_dominated or (high_grain and low_res):
         base = "manual_review"
+    elif (not upscale) and side is not None and side >= 720 and blurry:
+        base = "check_source_upscaled_or_denoise"
     elif score is not None and score >= 45:
         base = "manual_review"
+    elif vr:
+        base = "vr_equirect_review"
     else:
         base = "low_priority_or_ok"
 
+    if combed and base == "artifact_reduction_review":
+        base = "manual_review"
+    if unstable and base == "low_priority_or_ok":
+        base = "manual_review"
     if processed:
         return "already_processed_review_only+" + base
     return base
@@ -1176,18 +1948,45 @@ def create_contact_sheet(video_path, frames_with_ts, result, output_folder, thum
     return str(out_path)
 
 
+def wants_contact_sheet(result, config):
+    if not config.create_contact_sheets:
+        return False
+    score = result.get("quality_issue_score")
+    try:
+        if score is not None and score != "" and float(score) >= config.contact_sheet_min_score:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return recommendation_base(result.get("recommendation")) in CONTACT_REVIEW
+
+
 # ============================================================
 # Video analysis
 # ============================================================
 
+def _attach_identity(row, video_path):
+    path = Path(video_path)
+    if not path.exists():
+        return row
+    try:
+        size, mtime = file_identity(path)
+    except OSError:
+        return row
+    row["size"] = size
+    row["mtime"] = mtime
+    return row
+
+
 def analyze_video(video_path, config=None):
     """Analyze one video and return a report row."""
     config = config or ScanConfig()
+    limits = config.thresholds or DEFAULT_THRESHOLDS
     video_path = Path(video_path)
     processed = is_probably_processed(video_path)
 
     if config.skip_already_processed and processed:
         row = base_row(video_path, processed=processed)
+        _attach_identity(row, video_path)
         row["issue_flags"] = "skipped_already_processed_name"
         row["recommendation"] = "skipped"
         return row
@@ -1200,7 +1999,16 @@ def analyze_video(video_path, config=None):
         return row
 
     meta = ffprobe_video(video_path, config.probe_timeout)
+    processed = looks_processed(video_path, meta.get("encoder"))
+    if config.skip_already_processed and processed:
+        row = base_row(video_path, meta=meta, processed=processed)
+        _attach_identity(row, video_path)
+        row["issue_flags"] = "skipped_already_processed_name"
+        row["recommendation"] = "skipped"
+        return row
+
     row = base_row(video_path, meta=meta, processed=processed)
+    _attach_identity(row, video_path)
     if meta["width"] <= 0 or meta["height"] <= 0:
         row["issue_flags"] = "could_not_sample"
         row["recommendation"] = "manual_check_could_not_sample"
@@ -1212,8 +2020,13 @@ def analyze_video(video_path, config=None):
         row["error"] = "Could not read a positive duration"
         return row
 
+    vr = is_vr_equirect(meta["display_width"], meta["display_height"], limits)
+    row["is_vr"] = vr
     frames, decode_errors = extract_sample_frames(video_path, meta, config)
     row["sampled_frames"] = len(frames)
+    row["sample_errors"] = len(decode_errors)
+    if decode_errors:
+        row["sample_error"] = clip_error(decode_errors[0])
     if not frames:
         detail = decode_errors[-1] if decode_errors else ""
         message = "Could not sample frames"
@@ -1224,12 +2037,27 @@ def analyze_video(video_path, config=None):
         row["error"] = clip_error(message)
         return row
 
+    if vr:
+        crop = center_window(meta["width"], meta["height"])
+        block_crop = crop
+    else:
+        crop = consensus_letterbox([frame for _timestamp, frame in frames])
+        block_crop = None
+    content_w, content_h = display_dimensions(crop[2], crop[3], parse_sar(meta["sample_aspect_ratio"]), meta["rotation"])
+    side = short_side(crop[2], crop[3], content_w, content_h)
     measured = [
-        measure_frame(frame, config.analysis_frame_max_width)
+        measure_frame(
+            frame,
+            config.analysis_frame_max_width,
+            crop=crop,
+            block_crop=block_crop,
+            thresholds=limits,
+        )
         for _timestamp, frame in frames
     ]
-    stats = aggregate_metrics(measured)
-    side = short_side(
+    mark_duplicate_frames(measured, frames, crop)
+    stats = aggregate_metrics(measured, content_short_side=side)
+    container_side = short_side(
         meta["width"],
         meta["height"],
         meta["display_width"],
@@ -1241,10 +2069,49 @@ def analyze_video(video_path, config=None):
     bpp_second = bits_per_second_per_pixel(
         meta["bit_rate"], meta["width"], meta["height"]
     )
-    # Black and flat samples are not evidence of blur or blocking.
+    bpp_eff = None if bpp_frame is None else bpp_frame * codec_efficiency(meta["codec"], limits)
+    suspected = (not stats["mostly_dark"]) and upscale_suspected(
+        container_side,
+        stats["avg_blur"],
+        stats["bandwidth"],
+        limits,
+    )
+    judge_side = side
+    if suspected and stats["effective_height"] and 0 < stats["effective_height"] < side:
+        judge_side = stats["effective_height"]
     blur_for_score = None if stats["mostly_dark"] else stats["avg_blur"]
     block_for_score = None if stats["mostly_dark"] else stats["avg_block"]
-    score = calculate_issue_score(side, blur_for_score, block_for_score, bpp_frame)
+    # Resolution follows the active picture, or the effective short side
+    # when the container looks upscaled. Bitrate keeps the container side,
+    # because that is the grid the codec stored.
+    parts = issue_score_parts(
+        judge_side if suspected else side,
+        blur_for_score,
+        block_for_score,
+        bpp_frame,
+        codec=meta["codec"],
+        vr=vr,
+        thresholds=limits,
+    )
+    parts["score_bitrate"] = bitrate_points(
+        container_side,
+        bpp_frame,
+        codec=meta["codec"],
+        vr=vr,
+        thresholds=limits,
+    )
+    score = round(min(limits.score_cap, float(sum(parts.values()))), 2)
+    combed = False
+    field_order = str(meta.get("field_order") or "").lower()
+    if field_order in INTERLACED_FIELD_ORDERS:
+        combed = True
+    if stats["combing"] is not None and stats["combing"] >= limits.combing_min:
+        combed = True
+    unstable = (
+        stats["frames_used"] >= limits.unstable_min_frames
+        and stats["blur_cv"] is not None
+        and stats["blur_cv"] >= limits.unstable_blur_cv
+    )
     flags = build_issue_flags(
         side,
         stats["avg_blur"],
@@ -1254,6 +2121,14 @@ def analyze_video(video_path, config=None):
         median_noise=stats["median_noise"],
         mostly_dark=stats["mostly_dark"],
         blur_scale_ratio=stats["blur_scale_ratio"],
+        codec=meta["codec"],
+        vr=vr,
+        upscale=suspected,
+        combed=combed,
+        halo=stats["avg_halo"],
+        unstable=unstable,
+        bitrate_side=container_side,
+        thresholds=limits,
     )
     recommendation = assign_recommendation(
         side,
@@ -1264,30 +2139,56 @@ def analyze_video(video_path, config=None):
         median_noise=stats["median_noise"],
         blur_scale_ratio=stats["blur_scale_ratio"],
         mostly_dark=stats["mostly_dark"],
+        upscale=suspected,
+        effective_side=stats["effective_height"],
+        combed=combed,
+        vr=vr,
+        unstable=unstable,
+        thresholds=limits,
     )
     row.update({
+        "content_width": content_w,
+        "content_height": content_h,
+        "crop": ",".join(str(int(value)) for value in crop),
         "frames_used": stats["frames_used"],
         "frames_excluded": stats["frames_excluded"],
-        "avg_blur_score": round(stats["avg_blur"], 3),
-        "min_blur_score": round(stats["min_blur"], 3),
-        "max_blur_score": round(stats["max_blur"], 3),
+        "avg_blur_score": round_or_none(stats["avg_blur"], 3),
+        "median_blur_score": round_or_none(stats["median_blur"], 3),
+        "blur_p10": round_or_none(stats["blur_p10"], 3),
+        "blur_p90": round_or_none(stats["blur_p90"], 3),
+        "blur_iqr": round_or_none(stats["blur_iqr"], 3),
+        "blur_cv": round_or_none(stats["blur_cv"], 3),
+        "min_blur_score": round_or_none(stats["min_blur"], 3),
+        "max_blur_score": round_or_none(stats["max_blur"], 3),
         "blur_scale_ratio": round_or_none(stats["blur_scale_ratio"], 3),
-        "avg_blockiness_score": round(stats["avg_block"], 3),
-        "avg_noise_score": round(stats["avg_noise"], 3),
-        "median_noise_score": round(stats["median_noise"], 3),
-        "avg_brightness": round(stats["avg_brightness"], 3),
-        "avg_black_frame_ratio": round(stats["avg_black"], 4),
+        "blur_best_tiles": round_or_none(stats["blur_best_tiles"], 3),
+        "avg_blockiness_score": round_or_none(stats["avg_block"], 3),
+        "avg_noise_score": round_or_none(stats["avg_noise"], 3),
+        "median_noise_score": round_or_none(stats["median_noise"], 3),
+        "avg_halo_score": round_or_none(stats["avg_halo"], 3),
+        "combing_score": round_or_none(stats["combing"], 4),
+        "effective_bandwidth": round_or_none(stats["bandwidth"], 3),
+        "effective_height": round_or_none(stats["effective_height"], 1),
+        "upscale_suspected": bool(suspected),
+        "avg_brightness": round_or_none(stats["avg_brightness"], 3),
+        "avg_black_frame_ratio": round_or_none(stats["avg_black"], 4),
         "bitrate_per_pixel": round_or_none(bpp_second, 6),
         "bits_per_pixel_frame": round_or_none(bpp_frame, 6),
+        "bits_per_pixel_frame_eff": round_or_none(bpp_eff, 6),
+        "score_resolution": parts["score_resolution"],
+        "score_blur": parts["score_blur"],
+        "score_blockiness": parts["score_blockiness"],
+        "score_bitrate": parts["score_bitrate"],
         "quality_issue_score": score,
-        "resolution_class": classify_resolution(side),
-        "blur_class": classify_blur(stats["avg_blur"], stats["blur_scale_ratio"]),
-        "blockiness_class": classify_blockiness(stats["avg_block"]),
+        "resolution_class": classify_resolution(side, vr=vr),
+        "effective_resolution_class": classify_resolution(stats["effective_height"] or 0),
+        "blur_class": classify_blur(stats["avg_blur"], stats["blur_scale_ratio"], limits),
+        "blockiness_class": classify_blockiness(stats["avg_block"], limits),
         "issue_flags": ",".join(flags),
         "recommendation": recommendation,
     })
 
-    if config.create_contact_sheets and score >= config.contact_sheet_min_score:
+    if wants_contact_sheet(row, config):
         try:
             sheet_path = create_contact_sheet(
                 video_path,
@@ -1309,10 +2210,468 @@ def analyze_one(video_path, config):
         return analyze_video(video_path, config)
     except Exception as exc:
         row = base_row(video_path)
+        _attach_identity(row, video_path)
         row["issue_flags"] = "error"
         row["recommendation"] = "manual_check_error"
         row["error"] = clip_error(exc)
         return row
+
+
+# ============================================================
+# Pair mode
+# ============================================================
+
+def normalized_stem(filename):
+    stem = Path(str(filename)).stem.lower()
+    previous = None
+    while stem and previous != stem:
+        previous = stem
+        stem = PAIR_MARKER_RE.sub("", stem)
+    return stem
+
+
+def stems_related(name_a, name_b):
+    """True when two filenames are the same title with a processing suffix."""
+    left = normalized_stem(name_a)
+    right = normalized_stem(name_b)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    if len(short) < 4:
+        return False
+    if long.startswith(short) and (len(long) == len(short) or long[len(short)] in "_- ."):
+        return True
+    return False
+
+
+def _union_find(size):
+    parent = list(range(size))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left, right):
+        ra, rb = find(left), find(right)
+        if ra != rb:
+            parent[rb] = ra
+
+    return find, union
+
+
+def cluster_by_duration(rows, tolerance):
+    find, union = _union_find(len(rows))
+    durations = [safe_float(row.get("duration")) for row in rows]
+    for i in range(len(rows)):
+        if durations[i] <= 0:
+            continue
+        for j in range(i + 1, len(rows)):
+            if durations[j] > 0 and abs(durations[i] - durations[j]) <= tolerance:
+                union(i, j)
+    groups = {}
+    for index, row in enumerate(rows):
+        groups.setdefault(find(index), []).append(row)
+    return list(groups.values())
+
+
+def cluster_by_stem(rows):
+    find, union = _union_find(len(rows))
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            if stems_related(rows[i].get("filename") or "", rows[j].get("filename") or ""):
+                union(i, j)
+    groups = {}
+    for index, row in enumerate(rows):
+        groups.setdefault(find(index), []).append(row)
+    return list(groups.values())
+
+
+def row_has_score(row):
+    if str(row.get("error") or "").strip():
+        return False
+    score = row.get("quality_issue_score")
+    if score is None or score == "":
+        return False
+    try:
+        return not math.isnan(float(score))
+    except (TypeError, ValueError):
+        return False
+
+
+def display_aspect(row):
+    width = safe_float(row.get("display_width"))
+    height = safe_float(row.get("display_height"))
+    if width <= 0 or height <= 0:
+        return None
+    return width / height
+
+
+def aspects_mismatch(left, right, tolerance=0.02):
+    aspect_left = display_aspect(left)
+    aspect_right = display_aspect(right)
+    if aspect_left is None or aspect_right is None:
+        return False
+    return abs(aspect_left - aspect_right) / max(aspect_left, aspect_right) > tolerance
+
+
+def choose_reference(left, right):
+    """Prefer the square-pixel file, then the larger file, as the reference."""
+    left_distance = abs(math.log(parse_sar(left.get("sample_aspect_ratio"))))
+    right_distance = abs(math.log(parse_sar(right.get("sample_aspect_ratio"))))
+    if abs(left_distance - right_distance) > 0.02:
+        return (left, right) if left_distance < right_distance else (right, left)
+    if safe_int(left.get("size")) >= safe_int(right.get("size")):
+        return left, right
+    return right, left
+
+
+def plan_pairs(rows, tolerance):
+    """Pair rows that share a folder, a duration, and a related filename."""
+    by_folder = {}
+    for row in rows:
+        if not row_has_score(row):
+            continue
+        by_folder.setdefault(str(row.get("folder") or ""), []).append(row)
+    plans = []
+    for folder, items in by_folder.items():
+        for duration_group in cluster_by_duration(items, tolerance):
+            for component in cluster_by_stem(duration_group):
+                if len(component) < 2:
+                    continue
+                processed = [row for row in component if as_bool(row.get("is_probably_processed"))]
+                originals = [row for row in component if not as_bool(row.get("is_probably_processed"))]
+                if len(originals) == 1 and processed:
+                    for other in processed:
+                        plans.append((originals[0], other, ""))
+                    continue
+                matched = False
+                if processed and originals:
+                    for other in processed:
+                        matches = [
+                            original for original in originals
+                            if stems_related(original.get("filename") or "", other.get("filename") or "")
+                        ]
+                        if len(matches) == 1:
+                            plans.append((matches[0], other, ""))
+                            matched = True
+                    if matched:
+                        continue
+                if len(component) == 2 and not processed:
+                    reference, other = choose_reference(component[0], component[1])
+                    plans.append((reference, other, "no_processed_marker"))
+                    continue
+                plans.append((None, component, "ambiguous_group"))
+    return plans
+
+
+def group_key(folder, duration):
+    raw = f"{folder}|{round(safe_float(duration))}"
+    return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+
+
+def _metric(stats, median_key, avg_key):
+    value = stats.get(median_key)
+    if value is None:
+        value = stats.get(avg_key)
+    return value
+
+
+def display_bgr(frame, sar, rotation):
+    image = frame
+    if abs(float(sar) - 1.0) > 0.01:
+        height, width = image.shape[:2]
+        image = cv2.resize(
+            image,
+            (max(1, int(round(width * float(sar)))), height),
+            interpolation=cv2.INTER_AREA,
+        )
+    turns = int(round(abs(float(rotation)))) % 360
+    if turns == 90:
+        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif turns == 180:
+        image = cv2.rotate(image, cv2.ROTATE_180)
+    elif turns == 270:
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    return image
+
+
+def _row_meta(row):
+    return {
+        "width": safe_int(row.get("width")),
+        "height": safe_int(row.get("height")),
+        "duration": safe_float(row.get("duration")),
+    }
+
+
+def pair_picture_stats(frames, config):
+    crop = consensus_letterbox([frame for _timestamp, frame in frames])
+    limits = config.thresholds or DEFAULT_THRESHOLDS
+    measured = [
+        measure_frame(frame, config.analysis_frame_max_width, crop=crop, thresholds=limits)
+        for _timestamp, frame in frames
+    ]
+    mark_duplicate_frames(measured, frames, crop)
+    height, width = to_gray(frames[0][1]).shape[:2]
+    content_w, content_h = crop[2], crop[3]
+    side = min(content_w, content_h) if content_w and content_h else min(width, height)
+    return aggregate_metrics(measured, content_short_side=side), crop
+
+
+def compare_pair(original, other, config):
+    """Sample both files at the same timestamps and score the difference."""
+    orig_meta = _row_meta(original)
+    other_meta = _row_meta(other)
+    duration = min(orig_meta["duration"], other_meta["duration"])
+    count = min(8, resolved_sample_count(duration, config))
+    seed = path_seed(original.get("path"))
+    timestamps = sample_timestamps(duration, count, seed=seed)
+    orig_frames = []
+    other_frames = []
+    errors = []
+    for timestamp in timestamps:
+        orig_frame, orig_error = decode_frame(
+            original.get("path"),
+            timestamp,
+            orig_meta["width"],
+            orig_meta["height"],
+            config.frame_timeout,
+            1,
+        )
+        other_frame, other_error = decode_frame(
+            other.get("path"),
+            timestamp,
+            other_meta["width"],
+            other_meta["height"],
+            config.frame_timeout,
+            1,
+        )
+        if orig_frame is None or other_frame is None:
+            if orig_error:
+                errors.append(orig_error)
+            if other_error:
+                errors.append(other_error)
+            continue
+        orig_frames.append((timestamp, orig_frame))
+        other_frames.append((timestamp, other_frame))
+    if not orig_frames:
+        return None, None, None, errors or ["Could not decode a shared timestamp"]
+
+    orig_stats, _orig_crop = pair_picture_stats(orig_frames, config)
+    other_stats, _other_crop = pair_picture_stats(other_frames, config)
+    ssim_values = []
+    psnr_values = []
+    sheet_frames = []
+    for (timestamp, orig_frame), (_other_ts, other_frame) in zip(orig_frames, other_frames):
+        orig_gray = to_gray(display_bgr(orig_frame, parse_sar(original.get("sample_aspect_ratio")), safe_float(original.get("rotation"))))
+        other_gray = to_gray(display_bgr(other_frame, parse_sar(other.get("sample_aspect_ratio")), safe_float(other.get("rotation"))))
+        target_w = max(16, min(orig_gray.shape[1], other_gray.shape[1], config.analysis_frame_max_width))
+        target_h = max(16, min(orig_gray.shape[0], other_gray.shape[0]))
+        orig_fit = cv2.resize(orig_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        other_fit = cv2.resize(other_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        ssim = ssim_gray(orig_fit, other_fit)
+        psnr = psnr_gray(orig_fit, other_fit)
+        if ssim is not None:
+            ssim_values.append(ssim)
+        if psnr is not None:
+            psnr_values.append(psnr)
+        if len(sheet_frames) < 4:
+            orig_bgr = cv2.cvtColor(orig_fit, cv2.COLOR_GRAY2BGR)
+            other_bgr = cv2.cvtColor(other_fit, cv2.COLOR_GRAY2BGR)
+            divider = np.full((target_h, 4, 3), 255, np.uint8)
+            sheet_frames.append((timestamp, np.hstack([orig_bgr, divider, other_bgr])))
+    summary = {
+        "orig": orig_stats,
+        "other": other_stats,
+        "ssim": float(np.mean(ssim_values)) if ssim_values else None,
+        "psnr": float(np.mean(psnr_values)) if psnr_values else None,
+    }
+    return summary, sheet_frames, None, errors
+
+
+def pair_verdict(orig_stats, other_stats, halo_flag=8.0):
+    """Classify a processed file against its reference.
+
+    Positive blur delta means the other file is sharper. VMAF is not used:
+    fidelity to the original is a different question from whether the
+    picture got more watchable.
+    """
+    orig_blur = _metric(orig_stats, "median_blur", "avg_blur") or 0.0
+    other_blur = _metric(other_stats, "median_blur", "avg_blur") or 0.0
+    orig_noise = orig_stats.get("avg_noise") or 0.0
+    other_noise = other_stats.get("avg_noise") or 0.0
+    orig_block = orig_stats.get("avg_block") or 0.0
+    other_block = other_stats.get("avg_block") or 0.0
+    orig_halo = orig_stats.get("avg_halo") or 0.0
+    other_halo = other_stats.get("avg_halo") or 0.0
+    blur_delta = other_blur - orig_blur
+    noise_delta = other_noise - orig_noise
+    block_delta = other_block - orig_block
+    sharper = blur_delta > max(15.0, abs(orig_blur) * 0.12)
+    softer = blur_delta < -max(15.0, abs(orig_blur) * 0.12)
+    noisier = noise_delta > max(0.8, abs(orig_noise) * 0.25)
+    cleaner = noise_delta < -max(0.4, abs(orig_noise) * 0.15)
+    blockier = block_delta > 0.08
+    less_blocky = block_delta < -0.08
+    halo_worse = other_halo >= halo_flag and (other_halo - orig_halo) > 3.0
+    if sharper and halo_worse:
+        return "oversharpened"
+    bad = 0
+    good = 0
+    if softer:
+        bad += 2
+    if sharper:
+        good += 2
+    if noisier:
+        bad += 1
+    if cleaner:
+        good += 1
+    if blockier:
+        bad += 2
+    if less_blocky:
+        good += 1
+    if bad >= 2 and bad > good:
+        return "regressed"
+    if good >= 2 and good > bad:
+        return "improved"
+    return "similar"
+
+
+def _empty_group(**kwargs):
+    row = {column: None for column in GROUP_COLUMNS}
+    row.update(kwargs)
+    return row
+
+
+def _mark_paired(row):
+    row["is_probably_processed"] = True
+    flags = [flag for flag in str(row.get("issue_flags") or "").split(",") if flag]
+    if "paired_with_original" not in flags:
+        flags.append("paired_with_original")
+    if "already_processed_name" not in flags:
+        flags.append("already_processed_name")
+    row["issue_flags"] = ",".join(flags)
+    recommendation = str(row.get("recommendation") or "")
+    if recommendation and not recommendation.startswith("already_processed_review_only+"):
+        row["recommendation"] = "already_processed_review_only+" + recommendation
+
+
+def compare_library(rows, config):
+    """Write pair rows and mark processed siblings discovered by the match."""
+    limits = config.thresholds or DEFAULT_THRESHOLDS
+    plans = plan_pairs(rows, limits.pair_duration_seconds)
+    group_rows = []
+    for original, other, note in plans:
+        if note == "ambiguous_group":
+            component = other
+            folder = str(component[0].get("folder") or "")
+            duration = safe_float(component[0].get("duration"))
+            group_rows.append(_empty_group(
+                group_id=group_key(folder, duration),
+                folder=folder,
+                other_path=";".join(str(item.get("path") or "") for item in component),
+                other_filename=";".join(str(item.get("filename") or "") for item in component),
+                verdict="ambiguous_group",
+                note="More than one unmarked file shares this duration. Not compared.",
+            ))
+            continue
+        folder = str(original.get("folder") or "")
+        duration_delta = abs(safe_float(original.get("duration")) - safe_float(other.get("duration")))
+        record = _empty_group(
+            group_id=group_key(folder, original.get("duration")),
+            folder=folder,
+            original_path=str(original.get("path") or ""),
+            other_path=str(other.get("path") or ""),
+            original_filename=str(original.get("filename") or ""),
+            other_filename=str(other.get("filename") or ""),
+            duration_delta=round(duration_delta, 3),
+            duration_mismatch=duration_delta > limits.pair_duration_seconds,
+            sar_mismatch=aspects_mismatch(original, other),
+            original_display=f"{original.get('display_width')}x{original.get('display_height')}",
+            other_display=f"{other.get('display_width')}x{other.get('display_height')}",
+            note=note,
+        )
+        try:
+            summary, sheet_frames, _unused, errors = compare_pair(original, other, config)
+        except Exception as exc:
+            summary = None
+            sheet_frames = None
+            errors = [clip_error(exc)]
+        if not summary:
+            record["verdict"] = "compare_failed"
+            record["note"] = clip_error("; ".join(errors) if errors else "compare failed")
+            group_rows.append(record)
+            continue
+        orig_stats = summary["orig"]
+        other_stats = summary["other"]
+        record.update({
+            "blur_delta": round_or_none(
+                (_metric(other_stats, "median_blur", "avg_blur") or 0)
+                - (_metric(orig_stats, "median_blur", "avg_blur") or 0),
+                3,
+            ),
+            "noise_delta": round_or_none(
+                (other_stats.get("avg_noise") or 0) - (orig_stats.get("avg_noise") or 0),
+                3,
+            ),
+            "blockiness_delta": round_or_none(
+                (other_stats.get("avg_block") or 0) - (orig_stats.get("avg_block") or 0),
+                3,
+            ),
+            "halo_delta": round_or_none(
+                (other_stats.get("avg_halo") or 0) - (orig_stats.get("avg_halo") or 0),
+                3,
+            ),
+            "ssim": round_or_none(summary.get("ssim"), 4),
+            "psnr": round_or_none(summary.get("psnr"), 3),
+        })
+        verdict = pair_verdict(orig_stats, other_stats, limits.halo_flag)
+        record["verdict"] = verdict
+        if verdict == "improved":
+            record["best_version"] = record["other_path"]
+        else:
+            record["best_version"] = record["original_path"]
+        if note != "no_processed_marker":
+            _mark_paired(other)
+        if (
+            config.create_contact_sheets
+            and verdict in {"regressed", "oversharpened"}
+            and sheet_frames
+        ):
+            try:
+                create_contact_sheet(
+                    other.get("path"),
+                    sheet_frames,
+                    {
+                        "quality_issue_score": other.get("quality_issue_score"),
+                        "recommendation": verdict,
+                        "width": other.get("width"),
+                        "height": other.get("height"),
+                        "display_width": other.get("display_width"),
+                        "display_height": other.get("display_height"),
+                        "avg_blur_score": record["blur_delta"],
+                        "avg_blockiness_score": record["blockiness_delta"],
+                        "avg_noise_score": record["noise_delta"],
+                        "issue_flags": verdict,
+                    },
+                    config.contact_sheet_folder,
+                    config.contact_thumb_width,
+                )
+            except Exception:
+                pass
+        group_rows.append(record)
+    write_table(groups_output_path(config), group_rows, GROUP_COLUMNS)
+    return group_rows
+
+
+def groups_output_path(config):
+    if config.groups_csv:
+        return config.groups_csv
+    output = Path(config.output_csv)
+    return str(output.with_name(output.stem + "_groups" + output.suffix))
 
 
 # ============================================================
@@ -1335,13 +2694,18 @@ def find_video_files(root_folder, skip_dir_names=None):
                 yield path
 
 
-def paths_already_scanned(rows):
-    found = set()
-    for row in rows:
-        path = row.get("path") if isinstance(row, dict) else None
-        if path:
-            found.add(str(path))
-    return found
+def row_is_current(row):
+    """True when this row can be reused: same schema, size, and mtime."""
+    if safe_int(row.get("schema_version")) != SCHEMA_VERSION:
+        return False
+    path = row.get("path")
+    if not path or not Path(path).exists():
+        return False
+    try:
+        size, mtime = file_identity(path)
+    except OSError:
+        return False
+    return safe_int(row.get("size")) == size and safe_int(row.get("mtime")) == mtime
 
 
 def normalize_legacy_row(row):
@@ -1375,18 +2739,18 @@ def read_existing_rows(path):
     return [normalize_legacy_row(row) for row in records]
 
 
-def rows_to_dataframe(rows):
+def rows_to_dataframe(rows, columns):
     if not rows:
-        return pd.DataFrame(columns=CSV_COLUMNS)
+        return pd.DataFrame(columns=columns)
     frame = pd.DataFrame(rows)
-    for column in CSV_COLUMNS:
+    for column in columns:
         if column not in frame.columns:
             frame[column] = None
-    return frame.loc[:, CSV_COLUMNS]
+    return frame.loc[:, columns]
 
 
 def sorted_dataframe(rows):
-    frame = rows_to_dataframe(rows)
+    frame = rows_to_dataframe(rows, CSV_COLUMNS)
     if frame.empty:
         return frame
     frame = frame.copy()
@@ -1400,12 +2764,15 @@ def sorted_dataframe(rows):
     return frame.drop(columns=["_score", "_blur"])
 
 
-def write_report(path, rows):
-    """Atomically write a score-sorted CSV. Error rows sort last."""
+def write_table(path, rows, columns, sort_scores=False):
+    """Atomically replace a CSV."""
     path = Path(path)
     if path.parent and not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-    frame = sorted_dataframe(rows)
+    if sort_scores:
+        frame = sorted_dataframe(rows)
+    else:
+        frame = rows_to_dataframe(rows, columns)
     tmp = path.with_name(path.name + ".tmp")
     try:
         frame.to_csv(tmp, index=False, encoding="utf-8-sig")
@@ -1414,6 +2781,11 @@ def write_report(path, rows):
         if tmp.exists():
             tmp.unlink()
     return frame
+
+
+def write_report(path, rows):
+    """Atomically write a score-sorted CSV. Error rows sort last."""
+    return write_table(path, rows, CSV_COLUMNS, sort_scores=True)
 
 
 def ranked_mask(frame):
@@ -1464,7 +2836,9 @@ def print_summary(frame):
         "height",
         "display_width",
         "display_height",
+        "effective_height",
         "avg_blur_score",
+        "median_blur_score",
         "avg_blockiness_score",
         "bits_per_pixel_frame",
         "issue_flags",
@@ -1476,6 +2850,143 @@ def print_summary(frame):
         return
     existing_cols = [column for column in columns_to_show if column in ranked.columns]
     print(ranked[existing_cols].head(25).to_string(index=False))
+
+
+def print_group_summary(path):
+    path = Path(path)
+    if not path.exists():
+        return
+    frame = pd.read_csv(path)
+    print(f"\nPair groups: {len(frame)} ({path})")
+    if frame.empty or "verdict" not in frame.columns:
+        return
+    counts = frame["verdict"].fillna("").value_counts()
+    for verdict, count in counts.items():
+        print(f"  {verdict}: {count}")
+
+
+# ============================================================
+# Calibration
+# ============================================================
+
+def _natural_frame(height, width, seed):
+    rng = np.random.default_rng(seed)
+    image = np.full((height, width), 120, np.float32)
+    for _ in range(80):
+        x = int(rng.integers(0, max(1, width - 8)))
+        y = int(rng.integers(0, max(1, height - 8)))
+        image[
+            y:y + int(rng.integers(6, max(7, height // 6))),
+            x:x + int(rng.integers(6, max(7, width // 6))),
+        ] = rng.uniform(0, 255)
+    image += rng.normal(0, 2, image.shape)
+    return np.clip(image, 0, 255).astype(np.uint8)
+
+
+def calibration_checks():
+    """Direction checks for blur, noise, bandwidth, and blockiness.
+
+    These are the in-memory half of a calibration set. They do not tune
+    the numeric thresholds. They only fail when a metric moves backwards.
+    """
+    checks = []
+
+    def add(name, ok, detail):
+        checks.append((name, bool(ok), detail))
+
+    source = _natural_frame(360, 640, 3)
+    blur_scores = []
+    bandwidths = []
+    for sigma in (0, 1, 2, 4):
+        image = source if sigma == 0 else cv2.GaussianBlur(source, (0, 0), sigma)
+        blur_scores.append(blur_score_laplacian(image, 640))
+        bandwidths.append(effective_bandwidth(image))
+    add(
+        "blur decreases as gaussian blur increases",
+        all(earlier > later for earlier, later in zip(blur_scores, blur_scores[1:])),
+        " ".join(f"{score:.1f}" for score in blur_scores),
+    )
+    add(
+        "bandwidth decreases as gaussian blur increases",
+        all(
+            earlier is not None and later is not None and earlier > later
+            for earlier, later in zip(bandwidths, bandwidths[1:])
+        ),
+        " ".join("none" if value is None else f"{value:.2f}" for value in bandwidths),
+    )
+
+    rng = np.random.default_rng(5)
+    noise = np.clip(128 + rng.normal(0, 8, (180, 240)), 0, 255).astype(np.uint8)
+    flat = np.full((180, 240), 128, np.uint8)
+    edges = np.full((180, 240), 40, np.uint8)
+    cv2.rectangle(edges, (20, 20), (200, 140), 220, -1)
+    checker = (np.indices((180, 240)).sum(axis=0) % 2 * 255).astype(np.uint8)
+    add("noise sigma tracks grain", noise_sigma(noise) > 5, f"{noise_sigma(noise):.2f}")
+    add("flat image noise is ~0", noise_sigma(flat) < 0.5, f"{noise_sigma(flat):.2f}")
+    add("edges are not counted as noise", noise_sigma(edges) < 1.0, f"{noise_sigma(edges):.2f}")
+    add("checkerboard is not counted as noise", noise_sigma(checker) < 1.0, f"{noise_sigma(checker):.2f}")
+    add(
+        "uint8 median residual is not the noise column",
+        noise_sigma(noise) > 1.0,
+        "sigma is float; the old median of an 8-bit residual stays at 0",
+    )
+
+    native = _natural_frame(540, 960, 7)
+    small = cv2.resize(native, (320, 180), interpolation=cv2.INTER_AREA)
+    upscaled = cv2.resize(small, (960, 540), interpolation=cv2.INTER_CUBIC)
+    native_bw = effective_bandwidth(native)
+    up_bw = effective_bandwidth(upscaled)
+    add(
+        "cubic upscale of a 3x downsample has less bandwidth",
+        native_bw is not None and up_bw is not None and up_bw < native_bw - 0.15,
+        f"native={native_bw} upscaled={up_bw}",
+    )
+    add(
+        "upscaled frame is softer at the analysis width",
+        blur_score_laplacian(upscaled, 640) < blur_score_laplacian(native, 640),
+        f"native={blur_score_laplacian(native, 640):.1f} upscaled={blur_score_laplacian(upscaled, 640):.1f}",
+    )
+
+    content = _natural_frame(360, 720, 9)
+    framed = np.zeros((404, 720), np.uint8)
+    framed[22:382, :] = content
+    bounds = letterbox_bounds(framed)
+    cropped_blur = measure_frame(framed, crop=bounds)["blur"]
+    content_blur = blur_score_laplacian(content, 640)
+    add(
+        "letterbox crop removes black bars",
+        bounds[1] >= 16 and bounds[3] <= 370,
+        str(bounds),
+    )
+    add(
+        "blur after the letterbox crop matches the active picture",
+        content_blur > 0 and abs(cropped_blur - content_blur) / content_blur < 0.02,
+        f"content={content_blur:.1f} cropped={cropped_blur:.1f} bounds={bounds}",
+    )
+
+    block = np.zeros((128, 128), np.uint8)
+    for y in range(0, 128, 8):
+        for x in range(0, 128, 8):
+            block[y:y + 8, x:x + 8] = int(rng.integers(0, 255))
+    smooth = np.tile(np.linspace(0, 255, 128, dtype=np.uint8), (128, 1))
+    add(
+        "block grid outscores a smooth ramp",
+        blockiness_score(block) > blockiness_score(smooth),
+        f"block={blockiness_score(block):.2f} smooth={blockiness_score(smooth):.2f}",
+    )
+    return checks
+
+
+def run_calibration():
+    checks = calibration_checks()
+    failures = 0
+    for name, ok, detail in checks:
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {detail}")
+        if not ok:
+            failures += 1
+    if failures:
+        raise SystemExit(f"{failures} calibration check(s) failed")
+    print(f"\n{len(checks)} calibration checks passed.")
 
 
 # ============================================================
@@ -1516,13 +3027,19 @@ def build_parser():
             "examples:\n"
             "  python scan_video_quality.py --root ./videos --output report.csv\n"
             "  python scan_video_quality.py --root ./videos --workers 4 --contact-sheets\n"
-            "  python scan_video_quality.py --root ./videos --no-resume\n"
+            "  python scan_video_quality.py --root ./videos --samples 8 --no-pairs\n"
+            "  python scan_video_quality.py --calibrate\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--root", default=ROOT_FOLDER, help="Folder to scan recursively")
     parser.add_argument("--output", default=OUTPUT_CSV, help="CSV report path")
-    parser.add_argument("--samples", type=positive_int, default=SAMPLE_COUNT, help="Frames per video")
+    parser.add_argument(
+        "--samples",
+        type=positive_int,
+        default=None,
+        help="Frames per video. Default: at least 16, plus one per 5 minutes, capped at 40",
+    )
     parser.add_argument(
         "--analysis-width",
         type=analysis_width_type,
@@ -1551,22 +3068,30 @@ def build_parser():
     parser.add_argument("--no-skip-processed", dest="skip_already_processed", action="store_false")
     parser.add_argument("--resume", dest="resume", action="store_true")
     parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.add_argument("--pairs", dest="pairs", action="store_true")
+    parser.add_argument("--no-pairs", dest="pairs", action="store_false")
+    parser.add_argument("--groups-output", default="", help="CSV for original/processed pairs")
+    parser.add_argument("--config", default="", help="YAML file of threshold overrides")
+    parser.add_argument("--calibrate", action="store_true", help="Run metric direction checks and exit")
     parser.set_defaults(
         create_contact_sheets=CREATE_CONTACT_SHEETS,
         skip_already_processed=SKIP_ALREADY_PROCESSED,
         resume=True,
+        pairs=True,
     )
     return parser
 
 
 def config_from_args(args):
+    thresholds = load_thresholds(args.config) if args.config else Thresholds()
     return ScanConfig(
         root_folder=args.root,
         output_csv=args.output,
         create_contact_sheets=args.create_contact_sheets,
         contact_sheet_min_score=args.contact_sheet_min_score,
         contact_sheet_folder=args.contact_sheet_folder,
-        sample_count=args.samples,
+        sample_count=args.samples if args.samples is not None else SAMPLE_COUNT,
+        samples_explicit=args.samples is not None,
         analysis_frame_max_width=args.analysis_width,
         contact_thumb_width=CONTACT_THUMB_WIDTH,
         skip_already_processed=args.skip_already_processed,
@@ -1575,6 +3100,9 @@ def config_from_args(args):
         frame_timeout=args.frame_timeout,
         probe_timeout=args.probe_timeout,
         checkpoint_every=args.checkpoint_every,
+        pairs=args.pairs,
+        groups_csv=args.groups_output,
+        thresholds=thresholds,
     )
 
 
@@ -1596,24 +3124,40 @@ def scan_library(config):
     print(f"Found {len(files)} video files.")
 
     existing = read_existing_rows(config.output_csv) if config.resume else []
-    done = paths_already_scanned(existing)
+    kept = []
+    stale = 0
+    if config.resume:
+        for row in existing:
+            if row_is_current(row):
+                kept.append(row)
+            else:
+                stale += 1
+        if stale:
+            print(
+                f"Resume: re-scanning {stale} file(s) whose report schema, "
+                "size, or modification time does not match."
+            )
+    done = {str(row.get("path")) for row in kept if row.get("path")}
     pending = [path for path in files if str(path) not in done]
-    if config.resume and existing:
-        print(
-            f"Resume: skipping {len(files) - len(pending)} file(s) "
-            f"already in {config.output_csv}."
-        )
+    if config.resume and kept:
+        print(f"Resume: keeping {len(kept)} file(s) already in {config.output_csv}.")
 
     worker_count = min(config.workers, len(pending)) if pending else 1
     print(f"Analyzing {len(pending)} video file(s) with {worker_count} worker(s).")
-    rows = list(existing) if config.resume else []
+    rows = list(kept)
 
     def checkpoint():
         return write_report(config.output_csv, rows)
 
     if not pending:
+        if config.pairs:
+            print("Comparing original and processed pairs...")
+            compare_library(rows, config)
         frame = checkpoint()
         print(f"\nDone. Report saved to: {config.output_csv}")
+        if config.pairs:
+            print(f"Pair groups saved to: {groups_output_path(config)}")
+            print_group_summary(groups_output_path(config))
         print_summary(frame)
         return rows
 
@@ -1621,10 +3165,9 @@ def scan_library(config):
         rows.append(row)
         if row.get("error"):
             tqdm.write(f"Error: {row.get('path')}: {row.get('error')}")
-        if len(rows) - len(existing if config.resume else []) >= 1:
-            finished_new = len(rows) - (len(existing) if config.resume else 0)
-            if finished_new % config.checkpoint_every == 0:
-                checkpoint()
+        finished_new = len(rows) - len(kept)
+        if finished_new >= 1 and finished_new % config.checkpoint_every == 0:
+            checkpoint()
 
     try:
         if worker_count == 1:
@@ -1647,6 +3190,7 @@ def scan_library(config):
                         store_result(future.result())
                     except Exception as exc:
                         failed = base_row(video_path)
+                        _attach_identity(failed, video_path)
                         failed["issue_flags"] = "error"
                         failed["recommendation"] = "manual_check_error"
                         failed["error"] = clip_error(exc)
@@ -1656,8 +3200,14 @@ def scan_library(config):
         print(f"\nInterrupted. Partial report saved to: {config.output_csv}")
         raise
 
+    if config.pairs:
+        print("Comparing original and processed pairs...")
+        compare_library(rows, config)
     frame = checkpoint()
     print(f"\nDone. Report saved to: {config.output_csv}")
+    if config.pairs:
+        print(f"Pair groups saved to: {groups_output_path(config)}")
+        print_group_summary(groups_output_path(config))
     if config.create_contact_sheets:
         print(f"Contact sheets saved to: {config.contact_sheet_folder}")
     print_summary(frame)
@@ -1665,7 +3215,11 @@ def scan_library(config):
 
 
 def main(argv=None):
-    config = config_from_args(build_parser().parse_args(argv))
+    args = build_parser().parse_args(argv)
+    if args.calibrate:
+        run_calibration()
+        return
+    config = config_from_args(args)
     scan_library(config)
 
 
