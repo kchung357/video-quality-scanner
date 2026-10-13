@@ -10,11 +10,11 @@ It samples frames from each video, calculates heuristic quality metrics, assigns
 - Supports common video formats such as `.mp4`, `.mkv`, `.avi`, `.mov`, `.wmv`, `.mpg`, `.mpeg`, `.m4v`, `.ts`, `.m2ts`, `.webm`, `.flv`, and `.3gp`
 - Reads metadata once with FFprobe, including sample aspect ratio, rotation, encoder, color, and field order
 - Decodes full-resolution sample frames with FFmpeg
-- Crops black bars before blur, noise, and bandwidth, and leaves blockiness on the coded 8×8 grid
+- Crops black bars before blur, noise, and halo, and leaves blockiness on the coded 8×8 grid
 - Measures blur with Laplacian variance after scaling to a fixed analysis width
 - Records a tile sharpness score beside the full-frame blur score
-- Estimates where the spectrum falls off, so a soft HD container can be treated as upscaled SD
 - Estimates compression blockiness on the decoded pixels, without scaling or JPEG
+- Suggests a 16:9 re-encode from the content box: crop bars, reset sample aspect ratio, or pad/crop to 16:9
 - Estimates noise with a float sigma on flat pixels, and separates real detail from grain
 - Skips near-black, nearly flat, and duplicate frames when averaging picture metrics
 - Samples at least 16 frames, spread through the file, and reports median, percentiles, and spread
@@ -23,7 +23,7 @@ It samples frames from each video, calculates heuristic quality metrics, assigns
 - Classifies resolution from the shorter display side of the active picture
 - Assigns a 0–100 quality issue score and writes the four parts of that score
 - Suggests a review or restoration recommendation
-- Compares an original with a processed sibling at the same timestamps
+- Compares an original with a processed sibling at the same timestamps, against a bicubic upscale of the original
 - Writes a CSV report and can resume a scan when the file has not changed
 - Optional contact sheets for manual review
 
@@ -116,7 +116,7 @@ For each timestamp, FFmpeg seeks to about one second earlier, then decodes forwa
 That matters for the metrics:
 
 - Blockiness is measured on the decoded 8×8 grid. Scaling or JPEG would invent or destroy those blocks. Letterbox bars are not cropped out of this measurement, and a VR frame uses the center of the grid.
-- Blur, noise, halo, and bandwidth are measured on the active picture after a letterbox crop. Blur is then scaled to 640 px wide, so the blur thresholds stay comparable across resolutions.
+- Blur, noise, and halo are measured on the active picture after a letterbox crop. Blur is then scaled to 640 px wide, so the blur thresholds stay comparable across resolutions.
 - Grain is separated from real edges by comparing the blur score with the same score at half that width. Edges survive the extra downscale. Grain does not.
 - Noise is an Immerkaer sigma on locally flat pixels. The old median of an 8-bit residual was 0 on real pictures, so `median_noise_score` now comes from this float estimate, then the median across frames.
 - Near-black frames (mean at or below 20), nearly solid frames (standard deviation below 8), and duplicates of the previous kept frame are left out of the picture averages. If every sample is dark or flat, the score ignores blur and blockiness and the recommendation is `manual_review`.
@@ -132,7 +132,7 @@ By default the report is saved as:
 video_quality_report.csv
 ```
 
-`schema_version` is `2`. Reports from older versions are not resumed in place.
+`schema_version` is `3`. Reports from older versions are not resumed in place.
 
 | Column | Description |
 |---|---|
@@ -143,7 +143,9 @@ video_quality_report.csv
 | `width`, `height` | Coded frame size |
 | `display_width`, `display_height` | Size after sample aspect ratio and rotation |
 | `content_width`, `content_height` | Display size after the letterbox crop |
+| `content_aspect` | `content_width / content_height` |
 | `crop` | Coded crop as `x,y,width,height` |
+| `fix_geometry` | Re-encode hint such as `crop_bars+reset_sar:1280x720`, or blank when the picture is already square-pixel 16:9 |
 | `sample_aspect_ratio` | Sample aspect ratio reported by FFprobe |
 | `rotation` | Display rotation in degrees |
 | `codec` | Video codec |
@@ -171,11 +173,8 @@ video_quality_report.csv
 | `avg_blockiness_score` | Estimated compression blockiness |
 | `avg_noise_score` | Mean high-frequency residual |
 | `median_noise_score` | Median Immerkaer sigma on flat pixels. High values mean grain across the frame |
-| `avg_halo_score` | Edge overshoot. High values with a very high blur score suggest oversharpening |
+| `avg_halo_score` | Edge overshoot in pixel levels. High values with a very high blur score suggest oversharpening |
 | `combing_score` | Share of pixels that look interlaced |
-| `effective_bandwidth` | Fraction of Nyquist that still carries detail |
-| `effective_height` | `effective_bandwidth` times the shorter side of the active picture |
-| `upscale_suspected` | Soft HD container whose spectrum falls off early |
 | `avg_brightness` | Average brightness of the active picture, 0 to 255 |
 | `avg_black_frame_ratio` | Fraction of near-black pixels in the active picture |
 | `bitrate_per_pixel` | Bits per second per coded pixel |
@@ -184,7 +183,6 @@ video_quality_report.csv
 | `score_resolution`, `score_blur`, `score_blockiness`, `score_bitrate` | The four parts of the issue score |
 | `quality_issue_score` | Overall issue score from 0 to 100. Blank when the file could not be scored |
 | `resolution_class` | Resolution classification from the shorter side of the active picture |
-| `effective_resolution_class` | Classification of `effective_height` |
 | `blur_class` | `very_blurry`, `blurry`, `soft`, `slightly_soft`, `acceptable_sharpness`, `sharp`, or `grain_dominated` |
 | `blockiness_class` | Blockiness classification |
 | `issue_flags` | Detected quality issue flags |
@@ -203,7 +201,7 @@ Failed files have a blank `quality_issue_score`. They stay in the CSV and are li
 
 | Part | Ceiling | What raises it |
 |---|---:|---|
-| Resolution | 15 | Shorter side of the active picture at or below 720, more as it gets smaller. An upscale suspicion uses `effective_height` here |
+| Resolution | 15 | Shorter side of the active picture at or below 720, more as it gets smaller |
 | Blur | 45 | Low Laplacian variance at the analysis width |
 | Blockiness | 35 | Strong 8×8 block edges on the decoded frame |
 | Bitrate | 15 | Low bits per pixel per frame for the container size, after the codec factor. VR scores 0 |
@@ -228,7 +226,7 @@ Scores from older versions of this script are not comparable. The frame measurem
 |---|---|
 | `top_priority_restore` | Score is at least 75 and a more specific label did not apply |
 | `restore_deblur_artifact_reduce` | Low resolution, very blurry, and blocky |
-| `restore_or_deblur_then_upscale` | Low resolution and blurry. This includes an HD file whose effective short side is SD |
+| `restore_or_deblur_then_upscale` | Low resolution and blurry. A blurry HD file is not sent here |
 | `upscale_only_gentle` | Low resolution with real detail and no obvious blocking |
 | `upscale_candidate_very_low_res` | Very low resolution with real detail |
 | `check_source_upscaled_or_denoise` | Blurry HD that does not look like a straight upscale |
@@ -241,11 +239,27 @@ Scores from older versions of this script are not comparable. The frame measurem
 | `fix_path_or_missing_file` | The file was missing |
 | `skipped` | Skipped because the filename or encoder looks processed |
 
-`upscale_suspected` requires both a soft blur score and a low `effective_bandwidth`. Sharp frames are not relabeled from the spectrum alone. The bandwidth figure is an estimate of where detail falls about 22 dB from the low-frequency level. Heavy blur and a real upscale can land near each other. The blur score is what keeps a sharp file out of that label.
+A blurry HD file is `check_source_upscaled_or_denoise`. The scanner does not guess that a soft HD container is upscaled SD, and it does not tell you to upscale a file that is already HD. When both the original and a processed file are present, pair mode answers whether that process helped.
 
 Filenames that already look processed, or files paired with an original, get the same label with an `already_processed_review_only+` prefix, for example `already_processed_review_only+upscale_only_gentle`. Markers include `_topaz`, `_upscale`, `_proteus`, `_gaia`, `_prob`, and similar tokens. An encoder tag that contains Topaz, Proteus, Artemis, Video2X, or Real-ESRGAN counts as well.
 
 A sharp low-resolution file is labeled as an upscale candidate even when its score is low. Grain and near-black frames are not treated as detail worth upscaling.
+
+## Geometry
+
+`fix_geometry` says what a re-encode should do. The content box is the median letterbox crop, and only when those bars show up on at least half of the frames that are not near-black. Resolution class uses that content size.
+
+The display aspect is `content width × sample aspect ratio / content height`.
+
+| Picture | What the label means |
+|---|---|
+| Within about 3% of 16:9 | Scale to fit the target frame |
+| Cropping to 16:9 would drop at most about 10% of the area | `crop_to_16x9` |
+| Anything wider or taller than that | `pad_to_16x9` |
+| Black bars in the stored frame | `crop_bars` |
+| Sample aspect ratio is not 1:1 | `reset_sar` |
+
+720p-class content targets `1280×720`. 1080p-class content targets `1920×1080`. SD stays at its own display size, so a 4:3 DVD is padded rather than upscaled. A `1056×720` picture with sample aspect ratio `97:80` is exactly 16:9 once the side bars are cropped, so the label is `crop_bars+reset_sar:1280x720`.
 
 ## Pair groups
 
@@ -253,24 +267,40 @@ Pair mode is on unless you pass `--no-pairs`. It writes a second CSV next to the
 
 Two scored files are compared when they share a folder, their durations are within about a second, and their filenames are the same title. Processing suffixes such as `_prob4` and `_topaz` are removed before that comparison, so `DVDMS-388_3_prob4` can match `DVDMS-388`. Files in the same folder with the same duration but unrelated names, such as different episodes, are not compared.
 
-The reference is the file that does not look processed. Both files are sampled at the same timestamps, corrected for sample aspect ratio, and scored again. The group row includes:
+The reference is the file that does not look processed. Both files are sampled at the same timestamps. If a pair of frames is not the same picture (SSIM below about 0.6), the scanner tries two frames on either side. If more than about a third of the timestamps still miss, the verdict is `pair_misaligned`.
+
+Each kept timestamp is measured on its own, then the median of those deltas is the pair result. Two comparisons are made:
+
+- Native grid. The processed frame is downscaled to the original content size. Sharpness is compared with a bicubic upscale of the original brought back the same way, so the loss from resampling itself is not called damage. Blockiness is measured on the processed file at the scaled codec period (`8 × scale`), because a 1.5× upscale turns 8×8 blocks into 12×12 blocks.
+- Baseline. The original is bicubic-upscaled to the processed canvas. This is the "is it better than playback scaling?" test.
+
+A luma shift of about 10 or more, the usual tv-versus-full range step, is corrected before SSIM and the other ratios. It is recorded as `range_shift` and does not by itself fail the pair.
 
 | Column | Meaning |
 |---|---|
-| `blur_delta`, `noise_delta`, `blockiness_delta`, `halo_delta` | Processed file minus the reference. Positive blur means the processed file is sharper |
-| `ssim`, `psnr` | Similarity after both frames are fit to the same size. This is fidelity, not "better" |
-| `sar_mismatch` | Display aspect ratios differ by more than 2% |
-| `duration_mismatch` | Durations differ by more than the match window |
-| `verdict` | `improved`, `regressed`, `similar`, `oversharpened`, `ambiguous_group`, or `compare_failed` |
-| `best_version` | The file to keep. Oversharpened and regressed stay with the reference |
+| `blur_native` | Processed sharpness on the source grid, divided by the bicubic roundtrip. Below 1 means softer than a plain upscale |
+| `blur_vs_base` | Processed sharpness on the output canvas, divided by the bicubic upscale |
+| `block_native` | Scaled-period blockiness minus the original's 8-pixel blockiness |
+| `noise_native` | Noise on the source grid, as a ratio |
+| `halo_vs_base` | Edge overshoot on the output canvas, divided by the bicubic upscale |
+| `ssim` | Fidelity on the source grid after the luma correction. This is not a quality score |
+| `geometry_mismatch` | Content aspects differ by more than about 5%. Metrics are skipped |
+| `luma_delta`, `range_shift` | Mean Y difference before the correction |
+| `verdict` | `improved`, `neutral`, `regressed:<flags>`, `pair_misaligned`, `geometry_mismatch`, `ambiguous_group`, or `compare_failed` |
+| `action` | `keep_processed`, `keep_original`, or `manual_review` |
+| `best_version` | The file to keep |
 
-`ambiguous_group` means several unmarked files share a duration and the scanner will not guess. A large blur increase with a high halo score is `oversharpened` rather than `improved`.
+`improved` means the processed file is clearly sharper than bicubic and none of the damage flags fired. `neutral` means no damage and no gain over playback scaling, so the action stays `keep_original`. Damage flags are `lost_detail`, `more_blocky`, `more_noise`, and `oversharpened`. A sharpness drop that comes with a similar noise drop is treated as denoise, unless the softness is severe.
+
+`ambiguous_group` means several unmarked files share a duration and the scanner will not guess. `geometry_mismatch` means the content aspect changed, which is usually a bad crop, and the quality verdict would not be meaningful.
+
+These ratio cutoffs are starting points. `config.example.yaml` lists them. Check them against pairs you have already looked at before deleting either file.
 
 ## Contact sheets
 
 Contact sheets are off unless you pass `--contact-sheets`.
 
-They are written for a video whose score is at least `--contact-sheet-min-score`, and also for `manual_review`, `check_source_upscaled_or_denoise`, and `vr_equirect_review`. A pair whose verdict is `regressed` or `oversharpened` gets a sheet of the two frames side by side.
+They are written for a video whose score is at least `--contact-sheet-min-score`, and also for `manual_review`, `check_source_upscaled_or_denoise`, and `vr_equirect_review`. A pair whose verdict is anything other than `improved` gets a sheet of the two frames side by side.
 
 The file name includes the parent folder, the stem, and a short hash of the full path, so two folders with the same name do not overwrite each other.
 
@@ -280,7 +310,7 @@ The file name includes the parent folder, the stem, and a short hash of the full
 python scan_video_quality.py --calibrate
 ```
 
-This checks that blur and bandwidth fall as Gaussian blur increases, that a cubic upscale of a downscaled frame has less bandwidth than the original, that flat pixels and edges are not reported as grain, and that a letterbox crop measures the picture inside the bars. It does not choose new thresholds. Threshold changes belong after that check, and after a set of files you have labeled by eye.
+This checks that blur falls as Gaussian blur increases, that a bicubic upscale matches its own baseline, that a blurred upscale is softer than that baseline, that a 1.5× block grid is visible at the scaled period, and that a letterbox crop measures the picture inside the bars. It does not choose new thresholds. Threshold changes belong after that check, and after a set of files you have labeled by eye.
 
 ```bash
 python -m unittest test_scan_video_quality.py
