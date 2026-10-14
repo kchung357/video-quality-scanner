@@ -2923,17 +2923,176 @@ def _field_interlaced(row):
     return str(row.get("field_order") or "").lower() in INTERLACED_FIELD_ORDERS
 
 
+def evaluate_planned_pair(original, other, note, config):
+    """Score one pair without editing the caller's report rows.
+
+    Returns ``(group_row, mark_processed)``. The parent applies the mark to
+    the live report row. A worker only has a copy of that row.
+    """
+    limits = config.thresholds or DEFAULT_THRESHOLDS
+    folder = str(original.get("folder") or "")
+    duration_delta = abs(safe_float(original.get("duration")) - safe_float(other.get("duration")))
+    mismatch = aspects_mismatch(original, other, limits.geometry_aspect_tolerance)
+    notes = [note] if note else []
+    if _field_interlaced(original) or _field_interlaced(other):
+        notes.append("interlaced")
+    record = _empty_group(
+        group_id=group_key(folder, original.get("duration")),
+        folder=folder,
+        original_path=str(original.get("path") or ""),
+        other_path=str(other.get("path") or ""),
+        original_filename=str(original.get("filename") or ""),
+        other_filename=str(other.get("filename") or ""),
+        duration_delta=round(duration_delta, 3),
+        duration_mismatch=duration_delta > limits.pair_duration_seconds,
+        geometry_mismatch=mismatch,
+        original_display=f"{original.get('display_width')}x{original.get('display_height')}",
+        other_display=f"{other.get('display_width')}x{other.get('display_height')}",
+        original_content=f"{original.get('content_width')}x{original.get('content_height')}",
+        other_content=f"{other.get('content_width')}x{other.get('content_height')}",
+        note="; ".join(notes),
+    )
+    mark = note != "no_processed_marker"
+    if mismatch:
+        left_aspect = row_content_aspect(original)
+        right_aspect = row_content_aspect(other)
+        if left_aspect and right_aspect:
+            notes.append(f"content aspect {left_aspect:.3f} vs {right_aspect:.3f}")
+        record["note"] = "; ".join(part for part in notes if part)
+        record["verdict"] = "geometry_mismatch"
+        record["action"] = pair_action("geometry_mismatch")
+        record["best_version"] = record["original_path"]
+        return record, mark
+    try:
+        summary, sheet_frames, _unused, errors = compare_pair(original, other, config)
+    except Exception as exc:
+        summary = None
+        sheet_frames = None
+        errors = [clip_error(exc)]
+    if not summary:
+        record["verdict"] = "compare_failed"
+        record["action"] = "manual_review"
+        record["best_version"] = record["original_path"]
+        record["note"] = clip_error("; ".join(errors) if errors else "compare failed")
+        return record, False
+    record.update({
+        "blur_native": round_or_none(summary.get("blur_native"), 3),
+        "blur_vs_base": round_or_none(summary.get("blur_vs_base"), 3),
+        "block_native": round_or_none(summary.get("block_native"), 3),
+        "noise_native": round_or_none(summary.get("noise_native"), 3),
+        "halo_vs_base": round_or_none(summary.get("halo_vs_base"), 3),
+        "ssim": round_or_none(summary.get("ssim"), 4),
+        "luma_delta": round_or_none(summary.get("luma_delta"), 2),
+        "chroma_delta": round_or_none(summary.get("chroma_delta"), 2),
+        "range_shift": bool(summary.get("range_shift")),
+        "aligned_frames": summary.get("aligned_frames"),
+        "dropped_frames": summary.get("dropped_frames"),
+    })
+    if summary.get("range_shift"):
+        luma = summary.get("luma_delta")
+        notes.append("range_shift" if luma is None else f"range_shift luma_delta={luma:.1f}")
+    chroma = summary.get("chroma_delta")
+    if chroma is not None and chroma >= limits.pair_chroma_shift:
+        notes.append(f"color_shift chroma_delta={chroma:.1f}")
+    record["note"] = "; ".join(part for part in notes if part)
+    verdict = pair_verdict(summary, limits)
+    record["verdict"] = verdict
+    record["action"] = pair_action(verdict)
+    record["best_version"] = (
+        record["other_path"] if verdict == "improved" else record["original_path"]
+    )
+    if config.create_contact_sheets and verdict != "improved" and sheet_frames:
+        try:
+            create_contact_sheet(
+                other.get("path"),
+                sheet_frames,
+                {
+                    "quality_issue_score": other.get("quality_issue_score"),
+                    "recommendation": record["action"],
+                    "width": other.get("width"),
+                    "height": other.get("height"),
+                    "display_width": other.get("display_width"),
+                    "display_height": other.get("display_height"),
+                    "avg_blur_score": record["blur_native"],
+                    "avg_blockiness_score": record["block_native"],
+                    "avg_noise_score": record["noise_native"],
+                    "issue_flags": verdict,
+                },
+                config.contact_sheet_folder,
+                config.contact_thumb_width,
+            )
+        except Exception:
+            pass
+    return record, mark
+
+
+def _failed_pair_result(original, other, note, exc):
+    folder = str(original.get("folder") or "")
+    record = _empty_group(
+        group_id=group_key(folder, original.get("duration")),
+        folder=folder,
+        original_path=str(original.get("path") or ""),
+        other_path=str(other.get("path") or ""),
+        original_filename=str(original.get("filename") or ""),
+        other_filename=str(other.get("filename") or ""),
+        verdict="compare_failed",
+        action="manual_review",
+        best_version=str(original.get("path") or ""),
+        note=clip_error(exc),
+    )
+    if note:
+        record["note"] = note + "; " + record["note"]
+    return record, False
+
+
+def _run_pair_jobs(jobs, config):
+    """Run the slow pair decodes. ``jobs`` are ``(original, other, note)``."""
+    if not jobs:
+        return []
+    worker_count = min(max(1, int(config.workers)), len(jobs))
+    print(f"Comparing {len(jobs)} pair(s) with {worker_count} worker(s).")
+    if worker_count == 1:
+        results = []
+        for original, other, note in tqdm(jobs, desc="Comparing pairs"):
+            try:
+                results.append(evaluate_planned_pair(original, other, note, config))
+            except Exception as exc:
+                results.append(_failed_pair_result(original, other, note, exc))
+        return results
+
+    ordered = [None] * len(jobs)
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as executor:
+        futures = {
+            executor.submit(evaluate_planned_pair, original, other, note, config): index
+            for index, (original, other, note) in enumerate(jobs)
+        }
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Comparing pairs"):
+            index = futures[future]
+            original, other, note = jobs[index]
+            try:
+                ordered[index] = future.result()
+            except Exception as exc:
+                ordered[index] = _failed_pair_result(original, other, note, exc)
+    return ordered
+
+
 def compare_library(rows, config):
-    """Write pair rows and mark processed siblings discovered by the match."""
+    """Write pair rows and mark processed siblings discovered by the match.
+
+    Decoding a pair is independent work, so it uses ``--workers``. Tagging
+    the processed row stays here, because that row lives in the report list.
+    """
     limits = config.thresholds or DEFAULT_THRESHOLDS
     plans = plan_pairs(rows, limits.pair_duration_seconds)
-    group_rows = []
+    slots = []
+    jobs = []
     for original, other, note in plans:
         if note == "ambiguous_group":
             component = other
             folder = str(component[0].get("folder") or "")
             duration = safe_float(component[0].get("duration"))
-            group_rows.append(_empty_group(
+            slots.append(_empty_group(
                 group_id=group_key(folder, duration),
                 folder=folder,
                 other_path=";".join(str(item.get("path") or "") for item in component),
@@ -2943,107 +3102,25 @@ def compare_library(rows, config):
                 note="More than one unmarked file shares this duration. Not compared.",
             ))
             continue
-        folder = str(original.get("folder") or "")
-        duration_delta = abs(safe_float(original.get("duration")) - safe_float(other.get("duration")))
-        mismatch = aspects_mismatch(original, other, limits.geometry_aspect_tolerance)
-        notes = [note] if note else []
-        if _field_interlaced(original) or _field_interlaced(other):
-            notes.append("interlaced")
-        record = _empty_group(
-            group_id=group_key(folder, original.get("duration")),
-            folder=folder,
-            original_path=str(original.get("path") or ""),
-            other_path=str(other.get("path") or ""),
-            original_filename=str(original.get("filename") or ""),
-            other_filename=str(other.get("filename") or ""),
-            duration_delta=round(duration_delta, 3),
-            duration_mismatch=duration_delta > limits.pair_duration_seconds,
-            geometry_mismatch=mismatch,
-            original_display=f"{original.get('display_width')}x{original.get('display_height')}",
-            other_display=f"{other.get('display_width')}x{other.get('display_height')}",
-            original_content=f"{original.get('content_width')}x{original.get('content_height')}",
-            other_content=f"{other.get('content_width')}x{other.get('content_height')}",
-            note="; ".join(notes),
-        )
-        if mismatch:
-            left_aspect = row_content_aspect(original)
-            right_aspect = row_content_aspect(other)
-            if left_aspect and right_aspect:
-                notes.append(f"content aspect {left_aspect:.3f} vs {right_aspect:.3f}")
-            record["note"] = "; ".join(part for part in notes if part)
-            record["verdict"] = "geometry_mismatch"
-            record["action"] = pair_action("geometry_mismatch")
-            record["best_version"] = record["original_path"]
-            if note != "no_processed_marker":
+        if aspects_mismatch(original, other, limits.geometry_aspect_tolerance):
+            record, mark = evaluate_planned_pair(original, other, note, config)
+            if mark:
                 _mark_paired(other)
-            group_rows.append(record)
+            slots.append(record)
             continue
-        try:
-            summary, sheet_frames, _unused, errors = compare_pair(original, other, config)
-        except Exception as exc:
-            summary = None
-            sheet_frames = None
-            errors = [clip_error(exc)]
-        if not summary:
-            record["verdict"] = "compare_failed"
-            record["action"] = "manual_review"
-            record["best_version"] = record["original_path"]
-            record["note"] = clip_error("; ".join(errors) if errors else "compare failed")
-            group_rows.append(record)
-            continue
-        record.update({
-            "blur_native": round_or_none(summary.get("blur_native"), 3),
-            "blur_vs_base": round_or_none(summary.get("blur_vs_base"), 3),
-            "block_native": round_or_none(summary.get("block_native"), 3),
-            "noise_native": round_or_none(summary.get("noise_native"), 3),
-            "halo_vs_base": round_or_none(summary.get("halo_vs_base"), 3),
-            "ssim": round_or_none(summary.get("ssim"), 4),
-            "luma_delta": round_or_none(summary.get("luma_delta"), 2),
-            "chroma_delta": round_or_none(summary.get("chroma_delta"), 2),
-            "range_shift": bool(summary.get("range_shift")),
-            "aligned_frames": summary.get("aligned_frames"),
-            "dropped_frames": summary.get("dropped_frames"),
-        })
-        if summary.get("range_shift"):
-            luma = summary.get("luma_delta")
-            notes.append("range_shift" if luma is None else f"range_shift luma_delta={luma:.1f}")
-        chroma = summary.get("chroma_delta")
-        if chroma is not None and chroma >= limits.pair_chroma_shift:
-            notes.append(f"color_shift chroma_delta={chroma:.1f}")
-        record["note"] = "; ".join(part for part in notes if part)
-        verdict = pair_verdict(summary, limits)
-        record["verdict"] = verdict
-        record["action"] = pair_action(verdict)
-        record["best_version"] = (
-            record["other_path"] if verdict == "improved" else record["original_path"]
-        )
-        if note != "no_processed_marker":
+        slots.append(None)
+        jobs.append((len(slots) - 1, original, other, note))
+
+    job_results = _run_pair_jobs(
+        [(original, other, note) for _index, original, other, note in jobs],
+        config,
+    )
+    for (index, _original, other, _note), (record, mark) in zip(jobs, job_results):
+        if mark:
             _mark_paired(other)
-        if config.create_contact_sheets and verdict != "improved" and sheet_frames:
-            try:
-                create_contact_sheet(
-                    other.get("path"),
-                    sheet_frames,
-                    {
-                        "quality_issue_score": other.get("quality_issue_score"),
-                        "recommendation": record["action"],
-                        "width": other.get("width"),
-                        "height": other.get("height"),
-                        "display_width": other.get("display_width"),
-                        "display_height": other.get("display_height"),
-                        "avg_blur_score": record["blur_native"],
-                        "avg_blockiness_score": record["block_native"],
-                        "avg_noise_score": record["noise_native"],
-                        "issue_flags": verdict,
-                    },
-                    config.contact_sheet_folder,
-                    config.contact_thumb_width,
-                )
-            except Exception:
-                pass
-        group_rows.append(record)
-    write_table(groups_output_path(config), group_rows, GROUP_COLUMNS)
-    return group_rows
+        slots[index] = record
+    write_table(groups_output_path(config), slots, GROUP_COLUMNS)
+    return slots
 
 
 def groups_output_path(config):
@@ -3433,7 +3510,7 @@ def build_parser():
         "--workers",
         type=positive_int,
         default=DEFAULT_WORKERS,
-        help="Videos to analyze at once (default: up to 4)",
+        help="Videos and pair comparisons to run at once (default: up to 4)",
     )
     parser.add_argument("--frame-timeout", type=positive_float, default=60.0, help="Seconds per sample frame")
     parser.add_argument("--probe-timeout", type=positive_float, default=30.0, help="Seconds per ffprobe call")

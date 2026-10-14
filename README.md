@@ -86,7 +86,7 @@ python scan_video_quality.py --help
 | `--root` | `./videos` | Folder to scan recursively |
 | `--output` | `video_quality_report.csv` | CSV report path |
 | `--samples` | adaptive | Frames per video. Default is at least 16, one per 5 minutes, capped at 40 |
-| `--workers` | up to 4 | Videos analyzed at the same time |
+| `--workers` | up to 4 | Videos, and pair comparisons, run at the same time |
 | `--analysis-width` | `640` | Width used only for the blur score |
 | `--frame-timeout` | `60` | Seconds allowed for one sample frame |
 | `--probe-timeout` | `30` | Seconds allowed for one FFprobe call |
@@ -267,7 +267,7 @@ Pair mode is on unless you pass `--no-pairs`. It writes a second CSV next to the
 
 Two scored files are compared when they share a folder, their durations are within about a second, and their filenames are the same title. Processing suffixes such as `_prob4` and `_topaz` are removed before that comparison, so `DVDMS-388_3_prob4` can match `DVDMS-388`. Files in the same folder with the same duration but unrelated names, such as different episodes, are not compared.
 
-The reference is the file that does not look processed. Both files are sampled at the same timestamps. If a pair of frames is not the same picture (SSIM below about 0.6), the scanner tries two frames on either side. If more than about a third of the timestamps still miss, the verdict is `pair_misaligned`.
+The reference is the file that does not look processed. Pair comparisons use the same `--workers` pool as the scan. Each pair still decodes with one ffmpeg thread, so several pairs do not each take every core. Both files are sampled at the same timestamps. If a pair of frames is not the same picture (SSIM below about 0.6), the scanner tries two frames on either side. If more than about a third of the timestamps still miss, the verdict is `pair_misaligned`.
 
 Each kept timestamp is measured on its own, then the median of those deltas is the pair result. Two comparisons are made:
 

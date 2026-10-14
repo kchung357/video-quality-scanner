@@ -425,6 +425,36 @@ class ScanIntegrationTests(unittest.TestCase):
             self.assertTrue(str(processed["recommendation"]).startswith("already_processed_review_only+"))
             self.assertIn("paired_with_original", str(processed["issue_flags"]))
 
+    def test_pair_comparisons_use_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for folder, title in (("a", "ONE-1"), ("b", "TWO-2")):
+                directory = root / folder
+                directory.mkdir()
+                encode_clip(directory / f"{title}.mp4", "testsrc=size=160x120:rate=25:duration=1")
+                encode_clip(
+                    directory / f"{title}_prob4.mp4",
+                    "testsrc=size=160x120:rate=25:duration=1",
+                    "-vf", "gblur=sigma=2",
+                )
+            report = root / "report.csv"
+            scan.main([
+                "--root", str(root),
+                "--output", str(report),
+                "--samples", "2",
+                "--workers", "2",
+                "--no-contact-sheets",
+                "--frame-timeout", "30",
+            ])
+            groups = pd.read_csv(root / "report_groups.csv")
+            self.assertEqual(len(groups), 2)
+            self.assertEqual(set(groups["action"]), {"keep_original"})
+            frame = pd.read_csv(report)
+            processed = frame.loc[frame["filename"].astype(str).str.contains("_prob4")]
+            self.assertEqual(len(processed), 2)
+            for recommendation in processed["recommendation"]:
+                self.assertTrue(str(recommendation).startswith("already_processed_review_only+"))
+
 
 class MetricExtensionTests(unittest.TestCase):
     def test_noise_sigma_is_not_the_zero_median(self):
