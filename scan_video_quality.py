@@ -1,4 +1,10 @@
-"""Scan a video folder and write a CSV of heuristic quality issues.
+"""DEPRECATED: use ``python -m vqs`` (Video Quality Scanner v2) instead.
+
+This legacy script remains for reference. New work belongs in the ``vqs``
+package: SQLite + HTML report, GPU NR-IQA, LPIPS pair compare, and a real
+decode health pass.
+
+Scan a video folder and write a CSV of heuristic quality issues.
 
 Frame samples are full-resolution raw frames. Blur is measured after a
 letterbox crop and a scale to the analysis width. Blockiness stays on the

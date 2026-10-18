@@ -1,7 +1,8 @@
-# Optional threshold overrides for scan_video_quality.py.
-# Run with: python scan_video_quality.py --config config.example.yaml --root ./videos
+# Optional threshold overrides for Video Quality Scanner v2.
+# Run with: python -m vqs scan --config config.example.yaml --root Z:\Videos
 # Omitted keys keep the built-in defaults. Uncomment a line to change it.
 
+# --- Classical blur / block / noise ---
 # blur_very: 35
 # blur_blurry: 60
 # blur_soft: 100
@@ -12,23 +13,34 @@
 # block_blocky: 1.45
 # block_very: 1.60
 # median_noise_grainy: 4.0
-# hd_bpp_very_low: 0.04
-# hd_bpp_low: 0.07
-# sd_bpp_very_low: 0.05
-# sd_bpp_low: 0.09
 # dark_mean_brightness: 20
 # flat_std_max: 8
 # combing_min: 0.12
 # halo_flag: 8
+
+# --- Solo Topaz worthiness ---
+# topaz_max_short_side: 1080
+# topaz_hd_blur_max: 100
+# topaz_block_min: 1.40
+# topaz_nr_iqa_max: 0.45      # TOPIQ-NR below this counts as poor
+# topaz_nr_iqa_ok: 0.62       # at/above this, mild defects are ignored
+# topaz_min_confidence: 0.45
+
+# --- Pair keep / delete ---
+# pair_duration_seconds: 1.0
+# pair_ssim_align: 0.60
 # pair_blur_detail_ratio: 0.85
 # pair_blur_severe_ratio: 0.65
 # pair_block_delta: 0.10
 # pair_halo_ratio: 1.45
 # pair_halo_delta: 4
 # pair_blur_vs_base: 1.15
+# pair_lpips_max: 0.35
+# pair_nr_uplift_min: 0.03
 # geometry_fit_tolerance: 0.03
 # geometry_crop_area_max: 0.10
 # geometry_aspect_tolerance: 0.05
+
 # codec_efficiency:
 #   h264: 1.0
 #   hevc: 1.5
