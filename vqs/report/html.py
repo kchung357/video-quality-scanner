@@ -125,7 +125,16 @@ def _render_html(videos: list[dict], pairs: list[dict], report_dir: Path) -> str
 
     video_rows = [_video_payload(row, report_dir) for row in videos]
     pair_rows = [_pair_payload(row, report_dir) for row in pairs]
+    # Keep JSON raw inside <script>; entities are NOT decoded there.
+    # Escape only sequences that could break out of the script element.
     payload = json.dumps({"videos": video_rows, "pairs": pair_rows}, ensure_ascii=False)
+    payload = (
+        payload.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
     summary_bits = [
         f"<span><strong>{len(videos)}</strong> videos</span>",
@@ -304,7 +313,7 @@ tr:hover td {{ background: #202733; }}
     <p class="empty">Use the filter box, then <strong>Download filtered CSV</strong> to export the visible Topaz / All / Corrupt rows. Full dumps: <a href="videos.csv">videos.csv</a>, <a href="pairs.csv">pairs.csv</a>.</p>
   </section>
 </main>
-<script id="vqs-data" type="application/json">{_esc(payload)}</script>
+<script id="vqs-data" type="application/json">{payload}</script>
 <script>
 const DATA = JSON.parse(document.getElementById("vqs-data").textContent);
 let activeTab = "topaz";
