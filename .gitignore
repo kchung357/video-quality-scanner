@@ -225,6 +225,11 @@ Thumbs.db
 *.csv
 *.csv.tmp
 video_quality_report*.csv
+!labels.example.csv
+vqs.db
+*.db
+report/
+!config.example.yaml
 
 # Generated contact sheets
 contact_sheets/
