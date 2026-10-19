@@ -42,7 +42,7 @@ class HealthResult:
 def health_timeout_for(duration: float, configured: float = 0.0) -> float:
     if configured and configured > 0:
         return float(configured)
-    # Allow slow NAS seeks: 3x duration + two minutes, min 120s, max 6h.
+    # Allow slow remote/storage seeks: 3x duration + two minutes, min 120s, max 6h.
     return min(6 * 3600.0, max(120.0, float(duration or 0) * 3.0 + 120.0))
 
 

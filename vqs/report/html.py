@@ -292,7 +292,7 @@ tr:hover td {{ background: #202733; }}
   <div class="summary">{"".join(summary_bits)}</div>
 </header>
 <nav class="tabs" id="tabs">
-  <button type="button" data-tab="topaz" class="active">Topaz candidates</button>
+  <button type="button" data-tab="topaz" class="active">Upscale candidates</button>
   <button type="button" data-tab="pairs">Keep processed / Keep original</button>
   <button type="button" data-tab="corrupt">Corrupt / repair</button>
   <button type="button" data-tab="all">All videos</button>
@@ -310,7 +310,7 @@ tr:hover td {{ background: #202733; }}
   <section class="panel" id="panel-corrupt"></section>
   <section class="panel" id="panel-all"></section>
   <section class="panel" id="panel-export">
-    <p class="empty">Use the filter box, then <strong>Download filtered CSV</strong> to export the visible Topaz / All / Corrupt rows. Full dumps: <a href="videos.csv">videos.csv</a>, <a href="pairs.csv">pairs.csv</a>.</p>
+    <p class="empty">Use the filter box, then <strong>Download filtered CSV</strong> to export the visible Upscale / All / Corrupt rows. Full dumps: <a href="videos.csv">videos.csv</a>, <a href="pairs.csv">pairs.csv</a>.</p>
   </section>
 </main>
 <script id="vqs-data" type="application/json">{payload}</script>

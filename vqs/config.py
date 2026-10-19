@@ -33,7 +33,7 @@ class Thresholds:
     unstable_blur_cv: float = 1.0
     unstable_min_frames: int = 8
 
-    # Solo Topaz-worthiness
+    # Solo upscale-worthiness
     topaz_max_short_side: int = 1080
     topaz_hd_blur_max: float = 100.0
     topaz_block_min: float = 1.40

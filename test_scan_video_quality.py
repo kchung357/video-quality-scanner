@@ -397,9 +397,9 @@ class ScanIntegrationTests(unittest.TestCase):
     def test_pair_mode_compares_the_same_timestamps(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            encode_clip(root / "DVDMS-388.mp4", "testsrc=size=320x240:rate=25:duration=1")
+            encode_clip(root / "CLIP-101.mp4", "testsrc=size=320x240:rate=25:duration=1")
             encode_clip(
-                root / "DVDMS-388_3_prob4.mp4",
+                root / "CLIP-101_3_prob4.mp4",
                 "testsrc=size=320x240:rate=25:duration=1",
                 "-vf", "gblur=sigma=2",
             )
@@ -418,10 +418,10 @@ class ScanIntegrationTests(unittest.TestCase):
             self.assertIn("lost_detail", str(row["verdict"]))
             self.assertEqual(row["action"], "keep_original")
             self.assertFalse(bool(row["geometry_mismatch"]))
-            self.assertIn("DVDMS-388.mp4", str(row["best_version"]))
+            self.assertIn("CLIP-101.mp4", str(row["best_version"]))
             self.assertLess(float(row["blur_native"]), 0.85)
             frame = pd.read_csv(report)
-            processed = frame.loc[frame["filename"] == "DVDMS-388_3_prob4.mp4"].iloc[0]
+            processed = frame.loc[frame["filename"] == "CLIP-101_3_prob4.mp4"].iloc[0]
             self.assertTrue(str(processed["recommendation"]).startswith("already_processed_review_only+"))
             self.assertIn("paired_with_original", str(processed["issue_flags"]))
 
@@ -565,7 +565,7 @@ class MetricExtensionTests(unittest.TestCase):
             self.assertFalse(scan.row_is_current(changed))
 
     def test_pair_matching_and_verdict(self):
-        self.assertTrue(scan.stems_related("DVDMS-388.mp4", "DVDMS-388_3_prob4.mp4"))
+        self.assertTrue(scan.stems_related("CLIP-101.mp4", "CLIP-101_3_prob4.mp4"))
         self.assertFalse(scan.stems_related("color.mp4", "wide.mp4"))
         self.assertEqual(scan.normalized_stem("movie_topaz.mkv"), "movie")
 
@@ -587,13 +587,13 @@ class MetricExtensionTests(unittest.TestCase):
             return row
 
         original = scored(
-            "/library/title/DVDMS-388.mp4",
+            "/library/title/CLIP-101.mp4",
             size=50,
             content_width=1280,
             content_height=720,
         )
         processed = scored(
-            "/library/title/DVDMS-388_3_prob4.mp4",
+            "/library/title/CLIP-101_3_prob4.mp4",
             is_probably_processed=True,
             display_width=1552,
             display_height=720,
@@ -603,7 +603,7 @@ class MetricExtensionTests(unittest.TestCase):
             size=20,
         )
         cropped = scored(
-            "/library/title/DVDMS-388_badcrop.mp4",
+            "/library/title/CLIP-101_badcrop.mp4",
             is_probably_processed=True,
             content_width=1113,
             content_height=550,
@@ -613,8 +613,8 @@ class MetricExtensionTests(unittest.TestCase):
         plans = scan.plan_pairs([original, processed, unrelated], tolerance=1.0)
         paired = [plan for plan in plans if plan[2] != "ambiguous_group"]
         self.assertEqual(len(paired), 1)
-        self.assertEqual(paired[0][0]["filename"], "DVDMS-388.mp4")
-        self.assertEqual(paired[0][1]["filename"], "DVDMS-388_3_prob4.mp4")
+        self.assertEqual(paired[0][0]["filename"], "CLIP-101.mp4")
+        self.assertEqual(paired[0][1]["filename"], "CLIP-101_3_prob4.mp4")
         self.assertFalse(scan.aspects_mismatch(original, processed))
         self.assertTrue(scan.aspects_mismatch(original, cropped))
 

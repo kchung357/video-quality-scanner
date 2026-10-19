@@ -1,13 +1,13 @@
 # Video Quality Scanner v2
 
-Scan a video library (including a Windows mapped SMB/NAS share), find files that are **worth sending to Topaz**, judge whether **already-upscaled siblings are worth keeping**, and run a **full decode health check**.
+Scan a video library, find files that are **worth AI upscaling**, judge whether **already-processed siblings are worth keeping**, and run a **full decode health check**.
 
 v2 replaces the old single-file heuristic CSV tool with:
 
 - Modular Python package (`vqs`)
 - SQLite database + HTML review report
 - Classical artifact metrics (blur, blockiness, grain, halo, combing)
-- Optional **GPU no-reference IQA** (TOPIQ-NR via `pyiqa`) for Topaz worthiness
+- Optional **GPU no-reference IQA** (TOPIQ-NR via `pyiqa`) for upscale worthiness
 - Optional **LPIPS** + bicubic baseline for keep/delete on processed pairs
 - Dedicated FFmpeg health pass
 
@@ -47,22 +47,21 @@ pip install -e .
 ## Quick start
 
 ```powershell
-# Map your NAS, then:
-python -m vqs scan --root Z:\Videos --db D:\vqs\vqs.db --out D:\vqs\report --device cuda --cache-dir D:\vqs-cache
+python -m vqs scan --root ./videos --db ./vqs.db --out ./report --device cuda
 ```
 
-Open `D:\vqs\report\index.html` in a browser. Use the tabs:
+Open `./report/index.html` in a browser. Use the tabs:
 
-- **Topaz candidates** — ranked by confidence
+- **Upscale candidates** — ranked by confidence
 - **Keep processed / Keep original** — pair verdicts
 - **Corrupt / repair** — decode health failures
-- **Export filtered CSV** — for building a Topaz queue
+- **Export filtered CSV** — for building a processing queue
 
 ### Commands
 
 ```powershell
-python -m vqs scan --root Z:\Videos --db vqs.db --device cuda
-python -m vqs health --root Z:\Videos --db vqs.db
+python -m vqs scan --root ./videos --db vqs.db --device cuda
+python -m vqs health --root ./videos --db vqs.db
 python -m vqs pairs --db vqs.db
 python -m vqs report --db vqs.db --out report
 python -m vqs calibrate --quick
@@ -72,12 +71,12 @@ python -m vqs calibrate --db vqs.db --labels labels.csv
 | Flag | Default | Meaning |
 |---|---|---|
 | `--root` | `./videos` | Library root (recursive) |
-| `--db` | `vqs.db` | SQLite path (prefer local SSD, not the NAS) |
+| `--db` | `vqs.db` | SQLite path (prefer fast local disk over a network share) |
 | `--out` | `report` | HTML/CSV report folder |
 | `--device` | `auto` | `auto` / `cuda` / `cpu` |
 | `--workers` | `min(8, CPU count)` | Parallel workers for probe, health, sampling, and classical metrics. With CUDA, NR-IQA and LPIPS stay in the parent process |
 | `--samples` | adaptive 16–40 | Fixed frame count when set; omit for adaptive |
-| `--cache-dir` | _(empty)_ | Optional local cache directory for NAS-heavy runs |
+| `--cache-dir` | _(empty)_ | Optional local cache directory for remote/slow storage |
 | `--nr-iqa-model` | `topiq_nr` | No-reference IQA model name |
 | `--nr-iqa-batch` | `8` | NR-IQA batch size |
 | `--frame-timeout` | `60` | Seconds per sample frame |
@@ -90,7 +89,7 @@ python -m vqs calibrate --db vqs.db --labels labels.csv
 
 ## What “accurate” means in v2
 
-### Worth Topaz?
+### Worth upscaling?
 
 A file becomes `topaz_candidate` only when:
 
@@ -104,7 +103,7 @@ Each row has `decision`, `confidence`, and a short `reason` — not an opaque 0�
 
 ### Keep the upscale?
 
-Same-folder, duration-matched, stem-related pairs (e.g. `show.mp4` + `show_topaz.mp4`):
+Same-folder, duration-matched, stem-related pairs (e.g. `show.mp4` + `show_upscaled.mp4`):
 
 1. Align frames (SSIM gate + small search)
 2. **Fidelity**: LPIPS of processed-downscaled vs original (when available)
@@ -119,11 +118,11 @@ Actions: `keep_processed`, `keep_original`, `manual_review`.
 ffmpeg -v error -xerror -i FILE -f null -
 ```
 
-Statuses: `ok`, `errors`, `failed`. Corrupt files are never recommended for Topaz.
+Statuses: `ok`, `errors`, `failed`. Corrupt files are never recommended for upscaling.
 
-## Accuracy workflow (do this on your library)
+## Accuracy workflow
 
-Heuristics alone will never match your taste. After the first scan:
+Heuristics alone will never match every taste. After the first scan:
 
 1. Label ~50–100 files in `labels.csv` (see [labels.example.csv](labels.example.csv)):
    - `worth_topaz` / `not_worth` / `repair`
@@ -131,16 +130,16 @@ Heuristics alone will never match your taste. After the first scan:
 2. Run:
 
 ```powershell
-python -m vqs calibrate --db D:\vqs\vqs.db --labels labels.csv
+python -m vqs calibrate --db vqs.db --labels labels.csv
 ```
 
 3. Adjust thresholds in a YAML config from the printed suggestions, rescan changed rows with `--no-resume` or after touching files.
 
-## NAS / SMB notes
+## Storage tips
 
-- Keep `--db` and `--out` on the **local SSD** (`D:\…`), not the share.
-- Antivirus real-time scanning of the mapped drive often dominates runtime.
-- Prefer a mapped drive letter over a UNC path if tools mis-handle `\\server\share`.
+- Keep `--db` and `--out` on fast local disk when the library lives on a network share.
+- Antivirus real-time scanning of large media trees often dominates runtime.
+- On Windows, a mapped drive letter can be more reliable than a UNC path if tools mis-handle `\\server\share`.
 - Full health decode reads the whole file once; quality sampling seeks ~16–40 times.
 
 ## Migrating from v1

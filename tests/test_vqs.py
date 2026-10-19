@@ -190,10 +190,10 @@ class UtilTests(unittest.TestCase):
         self.assertFalse(looks_processed("movie.mp4"))
 
     def test_stem_related(self):
-        self.assertEqual(normalized_stem("DVDMS-388_topaz.mp4"), "dvdms-388")
-        self.assertEqual(normalized_stem("DVDMS-388_3_prob4.mp4"), "dvdms-388_3")
-        self.assertTrue(stems_related("DVDMS-388.mp4", "DVDMS-388_topaz.mp4"))
-        self.assertTrue(stems_related("DVDMS-388.mp4", "DVDMS-388_3_prob4.mp4"))
+        self.assertEqual(normalized_stem("CLIP-101_topaz.mp4"), "clip-101")
+        self.assertEqual(normalized_stem("CLIP-101_3_prob4.mp4"), "clip-101_3")
+        self.assertTrue(stems_related("CLIP-101.mp4", "CLIP-101_topaz.mp4"))
+        self.assertTrue(stems_related("CLIP-101.mp4", "CLIP-101_3_prob4.mp4"))
 
     def test_yaml_and_thresholds(self):
         mapping = parse_simple_yaml("blur_soft: 90\ncodec_efficiency:\n  hevc: 1.6\n")

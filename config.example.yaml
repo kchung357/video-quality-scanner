@@ -1,5 +1,5 @@
 # Optional threshold overrides for Video Quality Scanner v2.
-# Run with: python -m vqs scan --config config.example.yaml --root Z:\Videos
+# Run with: python -m vqs scan --config config.example.yaml --root ./videos
 # Omitted keys keep the built-in defaults. Uncomment a line to change it.
 
 # --- Classical blur / block / noise ---
@@ -18,7 +18,7 @@
 # combing_min: 0.12
 # halo_flag: 8
 
-# --- Solo Topaz worthiness ---
+# --- Solo upscale worthiness ---
 # topaz_max_short_side: 1080
 # topaz_hd_blur_max: 100
 # topaz_block_min: 1.40
