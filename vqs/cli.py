@@ -31,7 +31,7 @@ def positive_int(value):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vqs",
-        description="Video Quality Scanner v2 — Topaz worthiness, pair keep/delete, decode health",
+        description="Video Quality Scanner v2 — upscale worthiness, pair keep/delete, decode health",
     )
     parser.add_argument("--version", action="version", version=f"vqs {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan", help="Full library scan (health + solo + pairs + report)")
     _add_common(scan)
     scan.add_argument("--skip-health", action="store_true", help="Skip full decode health pass")
-    scan.add_argument("--skip-solo", action="store_true", help="Skip quality / Topaz decisions")
+    scan.add_argument("--skip-solo", action="store_true", help="Skip quality / upscale decisions")
     scan.add_argument("--skip-pairs", action="store_true", help="Skip original/processed compares")
     scan.add_argument("--skip-report", action="store_true", help="Skip HTML report generation")
     scan.add_argument("--no-contact-sheets", action="store_true")
@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_common(parser: argparse.ArgumentParser, need_root: bool = True) -> None:
     if need_root:
-        parser.add_argument("--root", default="./videos", help="Library root (mapped SMB drive OK)")
+        parser.add_argument("--root", default="./videos", help="Library root (recursive)")
     parser.add_argument("--db", default="vqs.db", help="SQLite database path")
     parser.add_argument("--out", default="report", dest="report_dir", help="HTML report folder")
     parser.add_argument("--config", default="", help="YAML threshold overrides")

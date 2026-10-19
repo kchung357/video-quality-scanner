@@ -225,7 +225,7 @@ def _print_summary(store: Store) -> None:
     top = [v for v in videos if v.get("decision") == "topaz_candidate"]
     top.sort(key=lambda item: float(item.get("confidence") or 0), reverse=True)
     if top:
-        print("\nTop Topaz candidates:")
+        print("\nTop upscale candidates:")
         for item in top[:15]:
             print(
                 f"  {item.get('confidence', 0):.2f}  "

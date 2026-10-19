@@ -1,4 +1,4 @@
-"""Decide whether a video is worth sending to Topaz."""
+"""Decide whether a video is worth AI upscaling."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def decide_solo(
         return _result(
             "repair_or_remux",
             0.95,
-            "decode health failed; fix file before Topaz",
+            "decode health failed; fix file before upscaling",
             resolution_class,
             blur_class,
             block_class,
@@ -66,7 +66,7 @@ def decide_solo(
         return _result(
             "manual_review",
             0.4,
-            "samples mostly dark/flat; cannot judge Topaz worth",
+            "samples mostly dark/flat; cannot judge upscale worth",
             resolution_class,
             blur_class,
             block_class,
@@ -88,7 +88,7 @@ def decide_solo(
         return _result(
             "manual_review",
             0.5,
-            "equirectangular VR; review manually (Topaz path differs)",
+            "equirectangular VR; review manually (upscale path differs)",
             resolution_class,
             blur_class,
             block_class,
@@ -141,7 +141,7 @@ def decide_solo(
         return _result(
             "manual_review",
             0.55,
-            "interlaced/combed; deinterlace before judging Topaz",
+            "interlaced/combed; deinterlace before judging upscale worth",
             resolution_class,
             blur_class,
             block_class,
@@ -163,7 +163,7 @@ def decide_solo(
         return _result(
             "skip_or_ok",
             0.65,
-            "grain looks like sharpness; denoise first or skip Topaz",
+            "grain looks like sharpness; denoise first or skip upscaling",
             resolution_class,
             blur_class,
             block_class,
@@ -174,7 +174,7 @@ def decide_solo(
         return _result(
             "skip_or_ok",
             0.75 if ok_nr else 0.6,
-            "already sharp; Topaz unlikely to help"
+            "already sharp; upscaling unlikely to help"
             + (" (blocking alone is not enough on HD)" if blocky or slightly_blocky else ""),
             resolution_class,
             blur_class,
@@ -186,7 +186,7 @@ def decide_solo(
         return _result(
             "skip_or_ok",
             0.7,
-            "no resolution/softness headroom for Topaz",
+            "no resolution/softness headroom for upscaling",
             resolution_class,
             blur_class,
             block_class,
@@ -257,7 +257,7 @@ def decide_solo(
         return _result(
             "manual_review",
             confidence,
-            "borderline Topaz case: " + ", ".join(reasons),
+            "borderline upscale case: " + ", ".join(reasons),
             resolution_class,
             blur_class,
             block_class,
@@ -267,7 +267,7 @@ def decide_solo(
     return _result(
         "topaz_candidate",
         confidence,
-        "worth Topaz: " + ", ".join(reasons),
+        "worth upscaling: " + ", ".join(reasons),
         resolution_class,
         blur_class,
         block_class,

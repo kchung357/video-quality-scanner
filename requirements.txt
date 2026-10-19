@@ -3,7 +3,7 @@ opencv-python>=4.5,<5
 numpy>=1.24,<3
 tqdm>=4.60,<5
 
-# Optional GPU stack (Topaz-worthiness NR-IQA + LPIPS pair fidelity)
+# Optional GPU stack (NR-IQA upscale worthiness + LPIPS pair fidelity)
 # Install a CUDA build of torch first for your driver, then:
 #   pip install pyiqa lpips
-# See README for Windows + RTX 50-series notes.
+# See README for GPU install notes.

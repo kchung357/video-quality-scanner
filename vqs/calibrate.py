@@ -229,7 +229,7 @@ def evaluate_labels(db_path: str, labels_csv: str) -> int:
             unknown += 1
             details.append((path, label, "unknown_label"))
 
-    print("Solo Topaz detection (worth_topaz / not_worth / repair):")
+    print("Solo upscale detection (worth_topaz / not_worth / repair):")
     precision = tp / (tp + fp) if (tp + fp) else None
     recall = tp / (tp + fn) if (tp + fn) else None
     print(f"  tp={tp} fp={fp} fn={fn} tn={tn}")

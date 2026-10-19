@@ -1,1 +1,1 @@
-"""Decision logic for Topaz worthiness and pair keep/delete."""
+"""Decision logic for upscale worthiness and pair keep/delete."""

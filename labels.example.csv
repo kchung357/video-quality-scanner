@@ -1,6 +1,6 @@
 path,label
-Z:\Videos\show\episode01.mp4,worth_topaz
-Z:\Videos\show\episode02.mp4,not_worth
-Z:\Videos\show\episode01_topaz.mp4,keep_processed
-Z:\Videos\show\episode03_prob4.mp4,keep_original
-Z:\Videos\broken\bad.mkv,repair
+./videos/show/episode01.mp4,worth_topaz
+./videos/show/episode02.mp4,not_worth
+./videos/show/episode01_upscaled.mp4,keep_processed
+./videos/show/episode03_prob4.mp4,keep_original
+./videos/broken/bad.mkv,repair
