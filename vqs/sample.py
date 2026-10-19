@@ -43,6 +43,13 @@ def sample_timestamps(duration, sample_count, seed=None) -> list[float]:
     return [float(min(max(float(stamp), 0.0), last_ok)) for stamp in stamps]
 
 
+def ffmpeg_thread_count(config: ScanConfig | None) -> int:
+    """Threads for one FFmpeg process. 0 leaves the choice to FFmpeg."""
+    if config is None:
+        return 0
+    return max(0, int(getattr(config, "ffmpeg_threads", 0) or 0))
+
+
 def seek_points(timestamp) -> tuple[float, float]:
     timestamp = max(0.0, float(timestamp))
     pre = max(0.0, timestamp - 1.0)
@@ -142,7 +149,7 @@ def extract_sample_frames(video_path, meta, config: ScanConfig, sample_count=Non
         seed = path_seed(video_path)
     source = maybe_cache_path(video_path, config.cache_dir if config else "")
     timestamps = sample_timestamps(meta["duration"], count, seed=seed)
-    threads = 1 if config is not None and config.workers > 1 else 0
+    threads = ffmpeg_thread_count(config)
     timeout = 60.0 if config is None else config.frame_timeout
     frames = []
     errors = []

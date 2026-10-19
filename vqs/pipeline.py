@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
 
-from vqs.analyze import analyze_video
+from vqs.analyze import analyze_video, finish_nr_and_decision, load_spilled_frames
 from vqs.config import ScanConfig, resolve_device
 from vqs.discover import find_video_files
 from vqs.metrics.nr_iqa import get_scorer
@@ -23,9 +24,34 @@ def _default_workers() -> int:
     return max(1, min(8, os.cpu_count() or 1))
 
 
-def _analyze_worker(args):
-    path, config = args
-    return analyze_video(path, config, do_health=config.run_health)
+def _health_snapshot(existing: dict | None) -> dict | None:
+    if not existing:
+        return None
+    keys = (
+        "health_status",
+        "health_error_count",
+        "health_first_error",
+        "health_progress",
+    )
+    return {key: existing.get(key) for key in keys if key in existing}
+
+
+def _scan_worker(path, config, existing, defer_nr, spill_frames_to_disk):
+    """Process-pool entry. CUDA scans pass defer_nr so this process never loads a model."""
+    return analyze_video(
+        path,
+        config,
+        do_health=config.run_health,
+        existing=existing,
+        nr_scorer=None,
+        defer_nr=defer_nr,
+        spill_frames_to_disk=spill_frames_to_disk,
+    )
+
+
+def _process_pool(workers: int) -> ProcessPoolExecutor:
+    # spawn so a parent that has already initialized CUDA is not forked.
+    return ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"))
 
 
 def scan_library(config: ScanConfig) -> Store:
@@ -64,21 +90,40 @@ def scan_library(config: ScanConfig) -> Store:
     if config.create_contact_sheets:
         sheet_dir.mkdir(parents=True, exist_ok=True)
 
-    # ProcessPool for classical+health is expensive with CUDA; run sequential
-    # when GPU IQA is wanted so one scorer stays warm. Workers>1 still helps
-    # classical-only CPU scans.
-    use_pool = config.workers > 1 and device == "cpu"
+    # One model stays in this process. Extra workers only run probe, health,
+    # sampling, and classical metrics. On CPU those workers also run NR-IQA,
+    # matching the previous CPU pool. On CUDA they return crops for this scorer.
+    worker_count = min(config.workers, len(pending)) if pending else 1
+    use_pool = worker_count > 1
+    defer_nr = use_pool and device == "cuda"
+    config.ffmpeg_threads = 2 if use_pool else 0
+    if use_pool and defer_nr:
+        print(f"Scheduling: {worker_count} CPU workers, NR-IQA on the parent ({device})")
+    elif use_pool:
+        print(f"Scheduling: {worker_count} CPU workers")
 
     done = 0
     if use_pool:
-        with ProcessPoolExecutor(max_workers=config.workers) as pool:
-            futures = {
-                pool.submit(analyze_video, str(path), config, do_health=config.run_health): path
-                for path in pending
-            }
+        spill = bool(config.create_contact_sheets)
+        with _process_pool(worker_count) as pool:
+            futures = {}
+            for path in pending:
+                existing = None if config.run_health else _health_snapshot(store.get_video(str(path)))
+                futures[
+                    pool.submit(
+                        _scan_worker,
+                        str(path),
+                        config,
+                        existing,
+                        defer_nr,
+                        spill,
+                    )
+                ] = path
             for future in tqdm(as_completed(futures), total=len(futures), desc="scan", unit="video"):
                 row = future.result()
-                _persist_row(store, row, config, sheet_dir, nr_scorer=None)
+                if defer_nr:
+                    row = finish_nr_and_decision(row, config, nr_scorer)
+                _persist_row(store, row, config, sheet_dir)
                 done += 1
                 if config.checkpoint_every and done % config.checkpoint_every == 0:
                     print(f"Checkpoint: {done}/{len(pending)}")
@@ -92,7 +137,7 @@ def scan_library(config: ScanConfig) -> Store:
                 existing=existing,
                 nr_scorer=nr_scorer,
             )
-            _persist_row(store, row, config, sheet_dir, nr_scorer=nr_scorer)
+            _persist_row(store, row, config, sheet_dir)
             done += 1
             if config.checkpoint_every and done % config.checkpoint_every == 0:
                 print(f"Checkpoint: {done}/{len(pending)}")
@@ -123,20 +168,27 @@ def scan_library(config: ScanConfig) -> Store:
     return store
 
 
-def _persist_row(store: Store, row: dict, config: ScanConfig, sheet_dir: Path, nr_scorer=None) -> None:
+def _persist_row(store: Store, row: dict, config: ScanConfig, sheet_dir: Path) -> None:
     frames = row.pop("_frames", None)
+    frames_path = row.pop("_frames_path", None)
     row.pop("_crop", None)
-    if (
-        config.create_contact_sheets
-        and frames
-        and row.get("decision")
-        in {
-            "topaz_candidate",
-            "manual_review",
-            "repair_or_remux",
-            "check_source_upscaled_or_denoise",
-        }
-    ):
+    row.pop("_content_frames", None)
+    row.pop("_metrics", None)
+    sheet_decisions = {
+        "topaz_candidate",
+        "manual_review",
+        "repair_or_remux",
+        "check_source_upscaled_or_denoise",
+    }
+    wants_sheet = config.create_contact_sheets and row.get("decision") in sheet_decisions
+    if frames is None and frames_path and wants_sheet:
+        try:
+            frames = load_spilled_frames(frames_path)
+        except Exception as exc:  # noqa: BLE001
+            row["error"] = (row.get("error") or "") or f"contact frames: {exc}"
+    if frames_path:
+        Path(frames_path).unlink(missing_ok=True)
+    if wants_sheet and frames:
         try:
             path = create_contact_sheet(
                 row["path"],
