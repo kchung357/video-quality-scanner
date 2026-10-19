@@ -15,17 +15,17 @@ The legacy script [`scan_video_quality.py`](scan_video_quality.py) remains for r
 
 ## Requirements
 
-- Windows 11 (or Linux/macOS)
+- Windows, Linux, or macOS
 - Python 3.11+
 - FFmpeg + FFprobe on `PATH`
-- For GPU accuracy (recommended on RTX 5070 Ti): CUDA PyTorch + `pyiqa` + `lpips`
+- For GPU accuracy (recommended): CUDA PyTorch + `pyiqa` + `lpips`
 
-## Install (Windows)
+## Install
 
 ```powershell
 cd video-quality-scanner
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1   # Linux/macOS: source .venv/bin/activate
 python -m pip install -U pip
 pip install -e .
 
@@ -35,7 +35,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install pyiqa lpips
 ```
 
-If CUDA PyTorch fails on a 50-series card, v2 still runs on CPU classical metrics and records `nr_iqa_unavailable`. Pair LPIPS also falls back to classical-only verdicts.
+If CUDA PyTorch is unavailable, v2 still runs on CPU classical metrics and records `nr_iqa_unavailable`. Pair LPIPS also falls back to classical-only verdicts.
 
 Core-only:
 
@@ -69,18 +69,24 @@ python -m vqs calibrate --quick
 python -m vqs calibrate --db vqs.db --labels labels.csv
 ```
 
-| Flag | Meaning |
-|---|---|
-| `--root` | Library root (recursive) |
-| `--db` | SQLite path (prefer local SSD, not the NAS) |
-| `--out` | HTML/CSV report folder |
-| `--device` | `auto` / `cuda` / `cpu` |
-| `--workers` | Parallel workers for probe, health, sampling, and classical metrics. With CUDA, NR-IQA and LPIPS stay in the parent process |
-| `--samples` | Fixed frame count (default adaptive 16–40) |
-| `--cache-dir` | Reserved local cache directory for NAS-heavy runs |
-| `--skip-health` / `--skip-pairs` / `--skip-report` | Run a subset |
-| `--no-resume` | Ignore prior DB rows |
-| `--config` | YAML threshold overrides ([config.example.yaml](config.example.yaml)) |
+| Flag | Default | Meaning |
+|---|---|---|
+| `--root` | `./videos` | Library root (recursive) |
+| `--db` | `vqs.db` | SQLite path (prefer local SSD, not the NAS) |
+| `--out` | `report` | HTML/CSV report folder |
+| `--device` | `auto` | `auto` / `cuda` / `cpu` |
+| `--workers` | `min(8, CPU count)` | Parallel workers for probe, health, sampling, and classical metrics. With CUDA, NR-IQA and LPIPS stay in the parent process |
+| `--samples` | adaptive 16–40 | Fixed frame count when set; omit for adaptive |
+| `--cache-dir` | _(empty)_ | Optional local cache directory for NAS-heavy runs |
+| `--nr-iqa-model` | `topiq_nr` | No-reference IQA model name |
+| `--nr-iqa-batch` | `8` | NR-IQA batch size |
+| `--frame-timeout` | `60` | Seconds per sample frame |
+| `--probe-timeout` | `30` | Seconds per ffprobe call |
+| `--health-timeout` | `0` | Seconds per full decode (`0` = no limit) |
+| `--checkpoint-every` | `5` | Persist progress every N files |
+| `--skip-health` / `--skip-pairs` / `--skip-report` | off | Run a subset |
+| `--no-resume` | off | Ignore prior DB rows |
+| `--config` | _(empty)_ | YAML threshold overrides ([config.example.yaml](config.example.yaml)) |
 
 ## What “accurate” means in v2
 
