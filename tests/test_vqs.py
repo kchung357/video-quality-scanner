@@ -325,6 +325,44 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(evaluate_labels(str(db), str(labels)), 0)
 
 
+class HealthTests(unittest.TestCase):
+    _DTS_LINE = (
+        "[null @ 000001a2d3ec18c0] Application provided invalid, non monotonically "
+        "increasing dts to muxer in stream 0: 61 >= 61"
+    )
+
+    def _run_health(self, *, returncode: int, stderr: str):
+        completed = subprocess.CompletedProcess(
+            args=["ffmpeg"],
+            returncode=returncode,
+            stdout=b"",
+            stderr=stderr.encode("utf-8"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            clip.write_bytes(b"fake")
+            with patch("vqs.health.subprocess.run", return_value=completed):
+                return check_video_health(clip, duration=1.0, timeout=5)
+
+    def test_benign_null_muxer_dts_exit_is_ok(self):
+        result = self._run_health(returncode=1, stderr=self._DTS_LINE + "\n")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.error_count, 0)
+        self.assertEqual(result.first_error, "")
+
+    def test_benign_null_muxer_dts_warning_without_exit_is_ok(self):
+        result = self._run_health(returncode=0, stderr=self._DTS_LINE + "\n")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.error_count, 0)
+
+    def test_real_decode_error_still_fails(self):
+        stderr = self._DTS_LINE + "\n[h264 @ 0] error while decoding MB 1 1, bytestream -11\n"
+        result = self._run_health(returncode=1, stderr=stderr)
+        self.assertEqual(result.status, "failed")
+        self.assertGreaterEqual(result.error_count, 1)
+        self.assertIn("decoding", result.first_error.lower())
+
+
 @unittest.skipUnless(FFMPEG, "ffmpeg not installed")
 class IntegrationTests(unittest.TestCase):
     def test_health_and_discover(self):

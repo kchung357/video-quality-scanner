@@ -23,6 +23,11 @@ _ERROR_HINTS = (
     "overread",
     "truncated",
 )
+# Null-muxer timestamp complaints from ``-f null`` are not decode failures and
+# do not affect typical playback; ``-xerror`` still aborts on them.
+_BENIGN_HINTS = (
+    "non monotonically increasing dts to muxer",
+)
 
 
 @dataclass
@@ -49,9 +54,14 @@ def _parse_time(text: str) -> float | None:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
+def _is_benign_line(line: str) -> bool:
+    lower = line.lower()
+    return any(token in lower for token in _BENIGN_HINTS)
+
+
 def _is_error_line(line: str) -> bool:
     lower = line.lower()
-    if not lower.strip():
+    if not lower.strip() or _is_benign_line(line):
         return False
     return any(token in lower for token in _ERROR_HINTS)
 
@@ -117,7 +127,8 @@ def check_video_health(path, duration: float = 0.0, timeout: float = 0.0, thread
 
     stderr = result.stderr.decode("utf-8", "replace")
     lines = [line.strip() for line in stderr.splitlines() if line.strip()]
-    errors = [line for line in lines if _is_error_line(line)]
+    substantive = [line for line in lines if not _is_benign_line(line)]
+    errors = [line for line in substantive if _is_error_line(line)]
     first = clip_error(errors[0]) if errors else ""
     progress = 1.0
     last_time = None
@@ -129,8 +140,13 @@ def check_video_health(path, duration: float = 0.0, timeout: float = 0.0, thread
         progress = min(1.0, last_time / float(duration))
 
     if result.returncode != 0:
+        # ``-xerror`` exits on the first error-level log, including benign
+        # null-muxer DTS complaints. Treat those as healthy when nothing else
+        # remains on stderr.
+        if not substantive:
+            return HealthResult(status="ok", error_count=0, first_error="", progress=1.0, message="ok")
         if not first:
-            first = clip_error(lines[-1] if lines else f"ffmpeg exit {result.returncode}")
+            first = clip_error(substantive[-1] if substantive else f"ffmpeg exit {result.returncode}")
         return HealthResult(
             status="failed",
             error_count=max(1, len(errors)),
