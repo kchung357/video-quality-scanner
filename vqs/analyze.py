@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
 
 from vqs import SCHEMA_VERSION
 from vqs.config import ScanConfig, resolve_device
@@ -12,18 +15,16 @@ from vqs.health import check_video_health, health_row_fields
 from vqs.metrics.classical import (
     ANALYSIS_FRAME_MAX_WIDTH,
     aggregate_metrics,
-    apply_crop,
     center_window,
     consensus_letterbox,
     geometry_plan,
     is_vr_equirect,
     mark_duplicate_frames,
     measure_frame,
-    to_gray,
 )
 from vqs.metrics.nr_iqa import get_scorer
 from vqs.probe import ffprobe_video
-from vqs.sample import extract_sample_frames
+from vqs.sample import extract_sample_frames, ffmpeg_thread_count
 from vqs.util import (
     clip_error,
     display_dimensions,
@@ -37,6 +38,95 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def content_crops(measured, frames, crop) -> list:
+    """BGR content crops in the same order NR-IQA scores them."""
+    x, y, w, h = crop
+    crops = []
+    for item, (_ts, frame) in zip(measured, frames):
+        if item.get("exclude"):
+            continue
+        crops.append(frame[y : y + h, x : x + w].copy())
+    return crops
+
+
+def spill_frames(frames, dest: Path) -> str:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        dest,
+        timestamps=np.asarray([ts for ts, _frame in frames], dtype=np.float64),
+        frames=np.stack([frame for _ts, frame in frames], axis=0),
+    )
+    saved = dest if dest.suffix == ".npz" else Path(str(dest) + ".npz")
+    return str(saved)
+
+
+def load_spilled_frames(path) -> list:
+    with np.load(path) as data:
+        timestamps = data["timestamps"]
+        frames = data["frames"]
+        loaded = []
+        for index in range(len(timestamps)):
+            loaded.append((float(timestamps[index]), np.array(frames[index], copy=True)))
+        return loaded
+
+
+def _spill_path(config: ScanConfig, video_path: str) -> Path:
+    digest = hashlib.sha1(str(video_path).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    return Path(config.report_dir) / "sheets" / "_spill" / f"{digest}.npz"
+
+
+def score_and_decide(row, config: ScanConfig, nr_scorer, content_frames, metrics) -> dict:
+    scorer = nr_scorer
+    if scorer is None:
+        device = resolve_device(config.device)
+        scorer = get_scorer(config.nr_iqa_model, device, config.nr_iqa_batch)
+    nr = scorer.score_bgr_frames(content_frames[: min(12, len(content_frames))])
+    row["nr_iqa_mean"] = nr.mean
+    row["nr_iqa_median"] = nr.median
+    row["nr_iqa_model"] = nr.model if nr.available else ""
+    row["nr_iqa_device"] = nr.device if nr.available else "unavailable"
+    if not nr.available and nr.message:
+        row["issue_flags"] = (row.get("issue_flags") or "") + (
+            ("," if row.get("issue_flags") else "") + "nr_iqa_unavailable"
+        )
+    decision = decide_solo(
+        content_width=int(row.get("content_width") or 0),
+        content_height=int(row.get("content_height") or 0),
+        display_width=int(row.get("display_width") or 0),
+        display_height=int(row.get("display_height") or 0),
+        metrics=metrics,
+        nr_iqa_median=nr.median,
+        health_status=str(row.get("health_status") or "unknown"),
+        is_processed=bool(row.get("is_probably_processed")),
+        is_vr=bool(row.get("is_vr")),
+        field_order=row.get("field_order") or "",
+        thresholds=config.thresholds,
+    )
+    row.update(decision)
+    return row
+
+
+def finish_nr_and_decision(row, config: ScanConfig, nr_scorer) -> dict:
+    """Score crops prepared by a CPU worker and apply the solo decision."""
+    if row.get("decision"):
+        row.pop("_content_frames", None)
+        row.pop("_metrics", None)
+        return row
+    content_frames = row.pop("_content_frames", None) or []
+    metrics = row.pop("_metrics", None) or {}
+    return score_and_decide(row, config, nr_scorer, content_frames, metrics)
+
+
+def _attach_review_frames(row, frames, crop, config: ScanConfig, spill: bool) -> None:
+    row["_crop"] = crop
+    if not frames or not config.create_contact_sheets:
+        return
+    if spill:
+        row["_frames_path"] = spill_frames(frames, _spill_path(config, row["path"]))
+        return
+    row["_frames"] = frames
+
+
 def analyze_video(
     video_path,
     config: ScanConfig,
@@ -44,6 +134,8 @@ def analyze_video(
     do_health: bool = True,
     existing: dict | None = None,
     nr_scorer=None,
+    defer_nr: bool = False,
+    spill_frames_to_disk: bool = False,
 ) -> dict:
     path = Path(video_path)
     row = {
@@ -98,7 +190,12 @@ def analyze_video(
     row["is_vr"] = vr
 
     if do_health:
-        health = check_video_health(path, meta.get("duration") or 0.0, config.health_timeout)
+        health = check_video_health(
+            path,
+            meta.get("duration") or 0.0,
+            config.health_timeout,
+            threads=ffmpeg_thread_count(config),
+        )
         row.update(health_row_fields(health))
     elif existing:
         for key in (
@@ -216,45 +313,16 @@ def analyze_video(
     ):
         row[key] = metrics.get(key)
 
-    # NR-IQA on non-dark content crops
-    device = resolve_device(config.device)
-    scorer = nr_scorer or get_scorer(config.nr_iqa_model, device, config.nr_iqa_batch)
-    content_frames = []
-    for item, (_ts, frame) in zip(measured, frames):
-        if item.get("exclude"):
-            continue
-        gray = apply_crop(to_gray(frame), crop)
-        # Rebuild BGR crop from full frame
-        x, y, w, h = crop
-        content_frames.append(frame[y : y + h, x : x + w].copy())
-    nr = scorer.score_bgr_frames(content_frames[: min(12, len(content_frames))])
-    row["nr_iqa_mean"] = nr.mean
-    row["nr_iqa_median"] = nr.median
-    row["nr_iqa_model"] = nr.model if nr.available else ""
-    row["nr_iqa_device"] = nr.device if nr.available else "unavailable"
-    if not nr.available and nr.message:
-        row["issue_flags"] = (row.get("issue_flags") or "") + (
-            ("," if row.get("issue_flags") else "") + "nr_iqa_unavailable"
-        )
+    content_frames = content_crops(measured, frames, crop)
+    if defer_nr:
+        # CPU worker stops before any model load. The parent scores these crops.
+        row["_content_frames"] = content_frames
+        row["_metrics"] = metrics
+        _attach_review_frames(row, frames, crop, config, spill_frames_to_disk)
+        return row
 
-    decision = decide_solo(
-        content_width=content_w,
-        content_height=content_h,
-        display_width=meta.get("display_width") or 0,
-        display_height=meta.get("display_height") or 0,
-        metrics=metrics,
-        nr_iqa_median=nr.median,
-        health_status=str(row.get("health_status") or "unknown"),
-        is_processed=processed,
-        is_vr=vr,
-        field_order=meta.get("field_order") or "",
-        thresholds=config.thresholds,
-    )
-    row.update(decision)
-
-    # Attach frames for optional contact sheet generation by caller
-    row["_frames"] = frames
-    row["_crop"] = crop
+    score_and_decide(row, config, nr_scorer, content_frames, metrics)
+    _attach_review_frames(row, frames, crop, config, spill_frames_to_disk)
     return row
 
 

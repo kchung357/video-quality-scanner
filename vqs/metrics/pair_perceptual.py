@@ -208,36 +208,55 @@ def evaluate_pair_frames(
     halo_proc = halo_score(proc_gray)
     halo_base = halo_score(base)
 
-    lpips_val = None
+    return apply_pair_model_scores(
+        {
+            "blur_native": safe_ratio(laplacian_var(proc_native), laplacian_var(base_native)),
+            "blur_vs_base": safe_ratio(laplacian_var(proc_gray), laplacian_var(base)),
+            "block_native": float(
+                blockiness_scaled(proc_frame, scale_x, scale_y) - blockiness_scaled(orig_frame, 1.0, 1.0)
+            ),
+            "noise_native": safe_ratio(noise_sigma(proc_native), noise_sigma(base_native), floor=0.05),
+            "halo_vs_base": float(halo_proc) / max(float(halo_base), 1.0),
+            "halo_delta": float(halo_proc - halo_base),
+            "ssim": ssim_gray(proc_native, orig_gray),
+            "lpips_native": None,
+            "nr_uplift": None,
+            "luma_delta": float(luma_delta),
+            "chroma_delta": float(chroma_delta),
+            "orig_view": orig_view,
+            "proc_view": proc_view,
+        },
+        lpips_scorer=lpips_scorer,
+        nr_scorer=nr_scorer,
+    )
+
+
+def apply_pair_model_scores(metrics, lpips_scorer=None, nr_scorer=None):
+    """Fill LPIPS and NR uplift for one aligned pair of content views.
+
+    Called from ``evaluate_pair_frames`` and again from the parent process when
+    decode ran in a worker that must not load CUDA.
+    """
+    if lpips_scorer is None and nr_scorer is None:
+        return metrics
+    orig_view = metrics.get("orig_view")
+    proc_view = metrics.get("proc_view")
+    if orig_view is None or proc_view is None:
+        return metrics
+    orig_w = orig_view.shape[1]
+    orig_h = orig_view.shape[0]
+    proc_h, proc_w = proc_view.shape[:2]
     if lpips_scorer is not None:
         # Fidelity: processed downscaled to original vs original content.
         proc_native_bgr = _resize_image(proc_view, orig_w, orig_h, cv2.INTER_AREA)
-        lpips_val = lpips_scorer.distance(orig_view, proc_native_bgr)
-
-    nr_uplift = None
+        metrics["lpips_native"] = lpips_scorer.distance(orig_view, proc_native_bgr)
     if nr_scorer is not None and getattr(nr_scorer, "available", False):
+        base_view = _resize_image(orig_view, proc_w, proc_h, cv2.INTER_CUBIC)
         proc_score = nr_scorer.score_bgr_frames([proc_view])
         base_score = nr_scorer.score_bgr_frames([base_view])
         if proc_score.median is not None and base_score.median is not None:
-            nr_uplift = float(proc_score.median - base_score.median)
-
-    return {
-        "blur_native": safe_ratio(laplacian_var(proc_native), laplacian_var(base_native)),
-        "blur_vs_base": safe_ratio(laplacian_var(proc_gray), laplacian_var(base)),
-        "block_native": float(
-            blockiness_scaled(proc_frame, scale_x, scale_y) - blockiness_scaled(orig_frame, 1.0, 1.0)
-        ),
-        "noise_native": safe_ratio(noise_sigma(proc_native), noise_sigma(base_native), floor=0.05),
-        "halo_vs_base": float(halo_proc) / max(float(halo_base), 1.0),
-        "halo_delta": float(halo_proc - halo_base),
-        "ssim": ssim_gray(proc_native, orig_gray),
-        "lpips_native": lpips_val,
-        "nr_uplift": nr_uplift,
-        "luma_delta": float(luma_delta),
-        "chroma_delta": float(chroma_delta),
-        "orig_view": orig_view,
-        "proc_view": proc_view,
-    }
+            metrics["nr_uplift"] = float(proc_score.median - base_score.median)
+    return metrics
 
 
 def _median_of(items, key):

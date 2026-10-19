@@ -75,7 +75,7 @@ python -m vqs calibrate --db vqs.db --labels labels.csv
 | `--db` | SQLite path (prefer local SSD, not the NAS) |
 | `--out` | HTML/CSV report folder |
 | `--device` | `auto` / `cuda` / `cpu` |
-| `--workers` | CPU workers for classical-only scans |
+| `--workers` | Parallel workers for probe, health, sampling, and classical metrics. With CUDA, NR-IQA and LPIPS stay in the parent process |
 | `--samples` | Fixed frame count (default adaptive 16–40) |
 | `--cache-dir` | Reserved local cache directory for NAS-heavy runs |
 | `--skip-health` / `--skip-pairs` / `--skip-report` | Run a subset |

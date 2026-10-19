@@ -7,23 +7,26 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
+from vqs.analyze import analyze_video, finish_nr_and_decision, load_spilled_frames, spill_frames
 from vqs.calibrate import calibration_checks, evaluate_labels, run_calibration
 from vqs.config import ScanConfig, load_thresholds, thresholds_from_mapping
 from vqs.decide.pairs import pair_verdict, plan_pairs
 from vqs.decide.solo import decide_solo
 from vqs.discover import find_video_files
-from vqs.health import check_video_health, health_timeout_for
+from vqs.health import build_health_command, check_video_health, health_timeout_for
 from vqs.metrics.classical import (
     blockiness_score,
     blur_profile,
     consensus_letterbox,
     measure_frame,
 )
-from vqs.metrics.nr_iqa import NrIqaScorer
+from vqs.metrics.nr_iqa import NrIqaResult, NrIqaScorer
+from vqs.sample import build_frame_command, ffmpeg_thread_count
 from vqs.report.html import write_report
 from vqs.store import Store
 from vqs.util import looks_processed, normalized_stem, parse_simple_yaml, stems_related
@@ -362,6 +365,190 @@ class IntegrationTests(unittest.TestCase):
             videos = store.list_videos()
             self.assertGreaterEqual(len(videos), 2)
             self.assertTrue((Path(tmp) / "report" / "index.html").exists())
+
+
+class _ParentScorer:
+    def __init__(self):
+        self.calls = 0
+
+    def score_bgr_frames(self, frames):
+        self.calls += 1
+        if not frames:
+            return NrIqaResult(None, None, "fake", "parent-gpu", False, "no frames")
+        values = [float(np.mean(frame)) / 255.0 for frame in frames]
+        arr = np.asarray(values, dtype=np.float64)
+        return NrIqaResult(float(arr.mean()), float(np.median(arr)), "fake", "parent-gpu", True)
+
+
+def _comparable_row(row):
+    return {
+        "decision": row.get("decision"),
+        "health_status": row.get("health_status"),
+        "reason": row.get("reason"),
+        "avg_blur": row.get("avg_blur"),
+        "avg_block": row.get("avg_block"),
+        "nr_iqa_median": row.get("nr_iqa_median"),
+        "nr_iqa_device": row.get("nr_iqa_device"),
+    }
+
+
+class SchedulingTests(unittest.TestCase):
+    def test_ffmpeg_threads_follow_the_pool(self):
+        self.assertEqual(ffmpeg_thread_count(ScanConfig(workers=1)), 0)
+        pooled = ScanConfig(workers=4, ffmpeg_threads=2)
+        self.assertEqual(ffmpeg_thread_count(pooled), 2)
+        cmd = build_frame_command("clip.mp4", 3.0, threads=ffmpeg_thread_count(pooled))
+        self.assertEqual(cmd[cmd.index("-threads") + 1], "2")
+        self.assertLess(cmd.index("-threads"), cmd.index("-i"))
+        health = build_health_command("clip.mp4", threads=2)
+        self.assertEqual(health[health.index("-threads") + 1], "2")
+        self.assertLess(health.index("-threads"), health.index("-i"))
+        self.assertNotIn("-threads", build_health_command("clip.mp4", threads=0))
+
+    def test_spill_roundtrip(self):
+        frame = np.zeros((8, 8, 3), np.uint8)
+        frame[0, 0] = (1, 2, 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "frames.npz"
+            spill_frames([(1.25, frame)], dest)
+            loaded = load_spilled_frames(dest)
+        self.assertEqual(loaded[0][0], 1.25)
+        self.assertTrue(np.array_equal(loaded[0][1], frame))
+
+    @unittest.skipUnless(FFMPEG, "ffmpeg not installed")
+    def test_deferred_nr_matches_inline_and_skips_worker_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            encode_clip(clip, seconds=0.4)
+            cfg = ScanConfig(
+                root_folder=tmp,
+                report_dir=str(Path(tmp) / "report"),
+                workers=4,
+                device="cuda",
+                create_contact_sheets=False,
+                samples_explicit=True,
+                sample_count=2,
+                resume=False,
+            )
+            scorer = _ParentScorer()
+            with patch("vqs.analyze.get_scorer", side_effect=AssertionError("worker loaded a model")):
+                deferred = analyze_video(str(clip), cfg, defer_nr=True)
+            self.assertFalse(deferred.get("decision"))
+            self.assertIn("_content_frames", deferred)
+            finished = finish_nr_and_decision(deferred, cfg, scorer)
+            direct = analyze_video(str(clip), cfg, nr_scorer=scorer)
+            self.assertEqual(_comparable_row(direct), _comparable_row(finished))
+            self.assertGreater(scorer.calls, 0)
+
+    @unittest.skipUnless(FFMPEG, "ffmpeg not installed")
+    def test_cuda_pool_keeps_parent_scores(self):
+        from vqs.pipeline import scan_library
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "videos"
+            root.mkdir()
+            encode_clip(root / "a.mp4", seconds=0.4)
+            encode_clip(root / "a_topaz.mp4", seconds=0.4)
+            encode_clip(root / "b.mp4", pattern="smptebars", seconds=0.4)
+            encode_clip(root / "b_topaz.mp4", pattern="smptebars", seconds=0.4)
+            scorer = _ParentScorer()
+
+            def make(workers, db_name):
+                return ScanConfig(
+                    root_folder=str(root),
+                    db_path=str(Path(tmp) / db_name),
+                    report_dir=str(Path(tmp) / f"report-{workers}"),
+                    workers=workers,
+                    device="cuda",
+                    create_contact_sheets=False,
+                    run_health=True,
+                    run_solo=True,
+                    run_pairs=True,
+                    run_report=False,
+                    samples_explicit=True,
+                    sample_count=4,
+                    resume=False,
+                )
+
+            with (
+                patch("vqs.pipeline.resolve_device", return_value="cuda"),
+                patch("vqs.pipeline.get_scorer", return_value=scorer),
+                patch("vqs.pairs_run.resolve_device", return_value="cpu"),
+            ):
+                serial = scan_library(make(1, "one.db"))
+                calls_after_serial = scorer.calls
+                pooled = scan_library(make(2, "two.db"))
+            self.assertGreater(scorer.calls, calls_after_serial)
+            serial_rows = {row["filename"]: _comparable_row(row) for row in serial.list_videos()}
+            pooled_rows = {row["filename"]: _comparable_row(row) for row in pooled.list_videos()}
+            self.assertEqual(serial_rows, pooled_rows)
+            for row in pooled_rows.values():
+                self.assertEqual(row["nr_iqa_device"], "parent-gpu")
+                self.assertEqual(row["health_status"], "ok")
+            serial_pairs = {
+                (row["original_filename"], row["other_filename"]): (row["action"], row["verdict"])
+                for row in serial.list_pairs()
+            }
+            pooled_pairs = {
+                (row["original_filename"], row["other_filename"]): (row["action"], row["verdict"])
+                for row in pooled.list_pairs()
+            }
+            self.assertEqual(serial_pairs, pooled_pairs)
+            self.assertGreaterEqual(len(serial_pairs), 2)
+
+    @unittest.skipUnless(FFMPEG, "ffmpeg not installed")
+    def test_pool_contact_sheets_and_health_command(self):
+        from vqs.cli import cmd_health
+        from vqs.pipeline import scan_library
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "videos"
+            root.mkdir()
+            encode_clip(root / "a.mp4", seconds=0.4)
+            encode_clip(root / "b.mp4", pattern="smptebars", seconds=0.4)
+            report = Path(tmp) / "report"
+            cfg = ScanConfig(
+                root_folder=str(root),
+                db_path=str(Path(tmp) / "vqs.db"),
+                report_dir=str(report),
+                workers=2,
+                device="cuda",
+                create_contact_sheets=True,
+                run_health=True,
+                run_pairs=False,
+                run_report=False,
+                samples_explicit=True,
+                sample_count=2,
+                resume=False,
+            )
+            with (
+                patch("vqs.pipeline.resolve_device", return_value="cuda"),
+                patch("vqs.pipeline.get_scorer", return_value=_ParentScorer()),
+            ):
+                store = scan_library(cfg)
+            sheets = list((report / "sheets").glob("*.jpg"))
+            spill = list((report / "sheets" / "_spill").glob("*.npz"))
+            self.assertGreaterEqual(len(sheets), 1)
+            self.assertEqual(spill, [])
+            self.assertTrue(any(row.get("contact_sheet") for row in store.list_videos()))
+
+            args = type(
+                "Args",
+                (),
+                {
+                    "db": str(Path(tmp) / "health.db"),
+                    "root": str(root),
+                    "workers": 2,
+                    "probe_timeout": 30.0,
+                    "health_timeout": 30.0,
+                },
+            )()
+            self.assertEqual(cmd_health(args), 0)
+            from vqs.store import Store
+
+            health_rows = Store(args.db).list_videos()
+            self.assertEqual(len(health_rows), 2)
+            self.assertTrue(all(row["health_status"] == "ok" for row in health_rows))
 
 
 if __name__ == "__main__":

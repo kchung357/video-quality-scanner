@@ -80,6 +80,9 @@ class ScanConfig:
     contact_thumb_width: int = 320
     skip_already_processed: bool = False
     workers: int = 4
+    # 0 lets FFmpeg pick its own thread count. The scan sets 2 while a process
+    # pool is running so several decodes do not each take every core.
+    ffmpeg_threads: int = 0
     resume: bool = True
     frame_timeout: float = 60.0
     probe_timeout: float = 30.0

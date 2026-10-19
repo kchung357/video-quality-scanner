@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from vqs import __version__
@@ -110,50 +112,85 @@ def config_from_args(args) -> ScanConfig:
     return cfg
 
 
+def _health_failure_row(path: Path, exc: BaseException) -> dict:
+    return {
+        "path": str(path),
+        "filename": path.name,
+        "folder": str(path.parent),
+        "health_status": "failed",
+        "health_first_error": clip_error(exc),
+        "decision": "repair_or_remux",
+        "confidence": 0.9,
+        "reason": "health/probe error",
+        "error": clip_error(exc),
+    }
+
+
+def _health_worker(path_str: str, probe_timeout: float, health_timeout: float, threads: int) -> dict:
+    path = Path(path_str)
+    try:
+        size, mtime = file_identity(path)
+        meta = ffprobe_video(path, probe_timeout)
+        result = check_video_health(path, meta.get("duration") or 0.0, health_timeout, threads=threads)
+        return {
+            "path": str(path),
+            "filename": path.name,
+            "folder": str(path.parent),
+            "size": size,
+            "mtime": mtime,
+            **meta,
+            **health_row_fields(result),
+            "_status": result.status,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return _health_failure_row(path, exc)
+
+
+def _merge_health_row(store: Store, row: dict) -> None:
+    status = row.pop("_status", row.get("health_status"))
+    if row.get("reason") == "health/probe error":
+        store.upsert_video(row)
+        return
+    existing = store.get_video(row["path"]) or {}
+    existing.update(row)
+    if not existing.get("decision"):
+        if status == "failed":
+            existing["decision"] = "repair_or_remux"
+            existing["confidence"] = 0.95
+            existing["reason"] = "decode health failed"
+        else:
+            existing["decision"] = existing.get("decision") or ""
+    store.upsert_video(existing)
+
+
 def cmd_health(args) -> int:
     check_external_tools()
     store = Store(args.db)
     files = find_video_files(args.root)
-    print(f"Health-checking {len(files)} file(s)…")
+    workers = args.workers if args.workers > 0 else max(1, min(8, os.cpu_count() or 1))
+    worker_count = min(workers, len(files)) if files else 1
+    threads = 2 if worker_count > 1 else 0
+    print(f"Health-checking {len(files)} file(s) with {worker_count} worker(s)…")
     from tqdm import tqdm
 
-    for path in tqdm(files, unit="video"):
-        try:
-            size, mtime = file_identity(path)
-            meta = ffprobe_video(path, args.probe_timeout)
-            result = check_video_health(path, meta.get("duration") or 0.0, args.health_timeout)
-            row = {
-                "path": str(path),
-                "filename": path.name,
-                "folder": str(path.parent),
-                "size": size,
-                "mtime": mtime,
-                **meta,
-                **health_row_fields(result),
+    if worker_count > 1:
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as pool:
+            futures = {
+                pool.submit(_health_worker, str(path), args.probe_timeout, args.health_timeout, threads): path
+                for path in files
             }
-            existing = store.get_video(str(path)) or {}
-            existing.update(row)
-            if not existing.get("decision"):
-                if result.status == "failed":
-                    existing["decision"] = "repair_or_remux"
-                    existing["confidence"] = 0.95
-                    existing["reason"] = "decode health failed"
-                elif not existing.get("decision"):
-                    existing["decision"] = existing.get("decision") or ""
-            store.upsert_video(existing)
-        except Exception as exc:  # noqa: BLE001
-            store.upsert_video(
-                {
-                    "path": str(path),
-                    "filename": path.name,
-                    "folder": str(path.parent),
-                    "health_status": "failed",
-                    "health_first_error": clip_error(exc),
-                    "decision": "repair_or_remux",
-                    "confidence": 0.9,
-                    "reason": "health/probe error",
-                    "error": clip_error(exc),
-                }
+            for future in tqdm(as_completed(futures), total=len(futures), unit="video"):
+                path = futures[future]
+                try:
+                    _merge_health_row(store, future.result())
+                except Exception as exc:  # noqa: BLE001
+                    store.upsert_video(_health_failure_row(path, exc))
+    else:
+        for path in tqdm(files, unit="video"):
+            _merge_health_row(
+                store,
+                _health_worker(str(path), args.probe_timeout, args.health_timeout, threads),
             )
     print(f"Done. Database: {args.db}")
     return 0

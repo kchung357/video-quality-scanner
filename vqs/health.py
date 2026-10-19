@@ -56,7 +56,32 @@ def _is_error_line(line: str) -> bool:
     return any(token in lower for token in _ERROR_HINTS)
 
 
-def check_video_health(path, duration: float = 0.0, timeout: float = 0.0) -> HealthResult:
+def build_health_command(path, threads: int = 0) -> list[str]:
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-v",
+        "error",
+        "-xerror",
+    ]
+    if threads and int(threads) > 0:
+        cmd.extend(["-threads", str(int(threads))])
+    cmd.extend(
+        [
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0?",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    return cmd
+
+
+def check_video_health(path, duration: float = 0.0, timeout: float = 0.0, threads: int = 0) -> HealthResult:
     """Decode the whole file to null and collect stderr error lines.
 
     Uses ``-xerror`` so the first hard decode failure can abort early, while
@@ -67,21 +92,7 @@ def check_video_health(path, duration: float = 0.0, timeout: float = 0.0) -> Hea
         return HealthResult(status="failed", first_error="file missing", message="file missing")
 
     limit = health_timeout_for(duration, timeout)
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-hide_banner",
-        "-v",
-        "error",
-        "-xerror",
-        "-i",
-        str(path),
-        "-map",
-        "0:v:0?",
-        "-f",
-        "null",
-        "-",
-    ]
+    cmd = build_health_command(path, threads=threads)
     try:
         result = subprocess.run(
             cmd,
