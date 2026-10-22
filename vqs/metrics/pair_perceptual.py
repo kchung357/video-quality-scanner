@@ -20,6 +20,55 @@ from vqs.metrics.classical import (
 from vqs.util import parse_sar, safe_float, safe_int
 
 
+# lpips 0.1.4 still calls these builders with pretrained=. Torchvision's
+# deprecated path loads ImageNet-1K V1 for each of them.
+_LPIPS_TORCHVISION_BUILDERS = {
+    "alexnet": "AlexNet_Weights",
+    "squeezenet1_1": "SqueezeNet1_1_Weights",
+    "vgg16": "VGG16_Weights",
+    "resnet18": "ResNet18_Weights",
+    "resnet34": "ResNet34_Weights",
+    "resnet50": "ResNet50_Weights",
+    "resnet101": "ResNet101_Weights",
+    "resnet152": "ResNet152_Weights",
+}
+
+
+def _imagenet1k_v1(weights_enum):
+    """Weight id equivalent to torchvision's deprecated ``pretrained=True``."""
+    if weights_enum is not None:
+        member = getattr(weights_enum, "IMAGENET1K_V1", None)
+        if member is not None:
+            return member
+    return "IMAGENET1K_V1"
+
+
+def install_lpips_torchvision_compat(models_module) -> None:
+    """Rewrite lpips' ``pretrained=`` calls onto torchvision's ``weights=`` API.
+
+    ``lpips.LPIPS(net="alex")`` ends in ``alexnet(pretrained=True)``. Since
+    torchvision 0.13 that argument warns, and a bool ``weights`` value warns
+    again. Passing ``AlexNet_Weights.IMAGENET1K_V1`` is the behavior that
+    warning describes, so LPIPS backbones stay the same without it.
+    """
+    for builder_name, weights_name in _LPIPS_TORCHVISION_BUILDERS.items():
+        original = getattr(models_module, builder_name, None)
+        if original is None or getattr(original, "_vqs_weights_compat", False):
+            continue
+        weights_enum = getattr(models_module, weights_name, None)
+
+        def compat(*args, _original=original, _weights_enum=weights_enum, **kwargs):
+            if "pretrained" in kwargs:
+                pretrained = kwargs.pop("pretrained")
+                if "weights" not in kwargs:
+                    kwargs["weights"] = _imagenet1k_v1(_weights_enum) if pretrained else None
+            return _original(*args, **kwargs)
+
+        compat._vqs_weights_compat = True
+        compat._vqs_original_builder = original
+        setattr(models_module, builder_name, compat)
+
+
 def to_bgr(frame):
     if frame.ndim == 2 or frame.shape[2] == 1:
         gray = frame if frame.ndim == 2 else frame[:, :, 0]
@@ -139,12 +188,14 @@ class LpipsScorer:
         try:
             import torch
             import lpips
+            import torchvision.models as tv_models
 
+            install_lpips_torchvision_compat(tv_models)
             self._torch = torch
-            self._fn = lpips.LPIPS(net="alex").to(device)
+            self._fn = lpips.LPIPS(net="alex").to(self.device)
             self._fn.eval()
             return True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — optional dependency path
             self._error = str(exc)
             return False
 

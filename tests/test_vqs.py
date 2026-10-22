@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +29,7 @@ from vqs.metrics.classical import (
     measure_frame,
 )
 from vqs.metrics.nr_iqa import NrIqaResult, NrIqaScorer
+from vqs.metrics.pair_perceptual import LpipsScorer, install_lpips_torchvision_compat
 from vqs.sample import build_frame_command, ffmpeg_thread_count
 from vqs.report.html import write_report
 from vqs.store import Store
@@ -285,6 +289,175 @@ class NrIqaFallbackTests(unittest.TestCase):
         result = scorer.score_bgr_frames([frame])
         self.assertFalse(result.available)
         self.assertIsNone(result.median)
+
+
+class LpipsTorchvisionCompatTests(unittest.TestCase):
+    def _models(self):
+        recorded = {}
+
+        def alexnet(*args, **kwargs):
+            recorded["args"] = args
+            recorded["kwargs"] = kwargs
+            if "pretrained" in kwargs or isinstance(kwargs.get("weights"), bool):
+                warnings.warn(
+                    "The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, "
+                    "please use 'weights' instead.",
+                    UserWarning,
+                )
+            return "alex-net"
+
+        def vgg16(*args, **kwargs):
+            recorded["vgg"] = kwargs
+            return "vgg"
+
+        class AlexNet_Weights:
+            IMAGENET1K_V1 = "alex-v1"
+
+        models = types.SimpleNamespace(
+            alexnet=alexnet,
+            vgg16=vgg16,
+            AlexNet_Weights=AlexNet_Weights,
+        )
+        return models, recorded
+
+    def test_pretrained_true_becomes_imagenet_v1_without_warning(self):
+        models, recorded = self._models()
+        install_lpips_torchvision_compat(models)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertEqual(models.alexnet(pretrained=True, progress=False), "alex-net")
+        self.assertEqual(caught, [])
+        self.assertEqual(recorded["kwargs"], {"weights": "alex-v1", "progress": False})
+
+    def test_pretrained_false_becomes_weights_none(self):
+        models, recorded = self._models()
+        install_lpips_torchvision_compat(models)
+        models.alexnet(pretrained=False)
+        self.assertIsNone(recorded["kwargs"]["weights"])
+        self.assertNotIn("pretrained", recorded["kwargs"])
+
+    def test_explicit_weights_win_and_install_is_idempotent(self):
+        models, recorded = self._models()
+        install_lpips_torchvision_compat(models)
+        wrapped = models.alexnet
+        install_lpips_torchvision_compat(models)
+        self.assertIs(models.alexnet, wrapped)
+        models.alexnet(pretrained=True, weights="keep-me")
+        self.assertEqual(recorded["kwargs"]["weights"], "keep-me")
+        models.vgg16(pretrained=True)
+        self.assertEqual(recorded["vgg"]["weights"], "IMAGENET1K_V1")
+
+    def test_scorer_load_uses_weights_api_and_configured_device(self):
+        recorded = {}
+
+        def alexnet(**kwargs):
+            recorded["kwargs"] = kwargs
+            if "pretrained" in kwargs:
+                warnings.warn(
+                    "The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, "
+                    "please use 'weights' instead.",
+                    UserWarning,
+                )
+            return object()
+
+        class AlexNet_Weights:
+            IMAGENET1K_V1 = object()
+
+        models = types.ModuleType("torchvision.models")
+        models.alexnet = alexnet
+        models.AlexNet_Weights = AlexNet_Weights
+        torchvision = types.ModuleType("torchvision")
+        torchvision.models = models
+
+        class Net:
+            def to(self, device):
+                recorded["device"] = device
+                return self
+
+            def eval(self):
+                recorded["eval"] = True
+                return self
+
+        def lpips_factory(net="alex"):
+            recorded["net"] = net
+            import torchvision.models as tv
+
+            tv.alexnet(pretrained=True)
+            return Net()
+
+        lpips = types.ModuleType("lpips")
+        lpips.LPIPS = lpips_factory
+        torch = types.ModuleType("torch")
+        scorer = LpipsScorer(device="cuda")
+        modules = {
+            "torch": torch,
+            "torchvision": torchvision,
+            "torchvision.models": models,
+            "lpips": lpips,
+        }
+        with patch.dict(sys.modules, modules):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertTrue(scorer._load())
+        self.assertEqual(caught, [])
+        self.assertIs(recorded["kwargs"]["weights"], AlexNet_Weights.IMAGENET1K_V1)
+        self.assertNotIn("pretrained", recorded["kwargs"])
+        self.assertEqual(recorded["device"], "cuda")
+        self.assertTrue(recorded["eval"])
+        self.assertEqual(recorded["net"], "alex")
+
+    def test_real_torchvision_alexnet_pretrained_does_not_warn(self):
+        try:
+            import torchvision.models as models
+            import torchvision.models._api as tv_api
+            from torchvision.models import AlexNet_Weights
+        except Exception as exc:  # noqa: BLE001 — optional dependency
+            self.skipTest(f"torchvision not installed: {exc}")
+
+        current = models.alexnet
+        raw_builder = current
+        seen_ids = set()
+        while getattr(raw_builder, "_vqs_weights_compat", False) and id(raw_builder) not in seen_ids:
+            seen_ids.add(id(raw_builder))
+            raw_builder = raw_builder._vqs_original_builder
+        original_loader = tv_api.load_state_dict_from_url
+        seen = {}
+
+        def skip_download(*_args, **_kwargs):
+            raise RuntimeError("skip weight download")
+
+        def spy(*args, **kwargs):
+            seen["kwargs"] = kwargs
+            return raw_builder(*args, **kwargs)
+
+        def warned(caught):
+            return [
+                str(item.message)
+                for item in caught
+                if issubclass(item.category, UserWarning)
+                and ("pretrained" in str(item.message) or "for 'weights'" in str(item.message))
+            ]
+
+        try:
+            tv_api.load_state_dict_from_url = skip_download
+            with warnings.catch_warnings(record=True) as before:
+                warnings.simplefilter("always")
+                with self.assertRaises(RuntimeError):
+                    raw_builder(pretrained=True)
+            self.assertTrue(warned(before), "expected the torchvision pretrained deprecation")
+
+            models.alexnet = spy
+            install_lpips_torchvision_compat(models)
+            with warnings.catch_warnings(record=True) as after:
+                warnings.simplefilter("always")
+                with self.assertRaises(RuntimeError):
+                    models.alexnet(pretrained=True)
+            self.assertEqual(warned(after), [])
+            self.assertIs(seen["kwargs"]["weights"], AlexNet_Weights.IMAGENET1K_V1)
+            self.assertNotIn("pretrained", seen["kwargs"])
+        finally:
+            models.alexnet = current
+            tv_api.load_state_dict_from_url = original_loader
 
 
 class CalibrationTests(unittest.TestCase):
